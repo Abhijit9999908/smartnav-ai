@@ -463,7 +463,7 @@ input  { font-family: inherit; }
   position: fixed;
   top: calc(var(--topbar-h) + var(--safe-t) + 8px);
   left: 12px; right: 12px;
-  z-index: 960;
+  z-index: 970;
   background: rgba(0,18,10,0.97);
   border: 1.5px solid rgba(0,230,118,0.38);
   border-radius: var(--r-xl);
@@ -472,6 +472,8 @@ input  { font-family: inherit; }
   backdrop-filter: blur(24px);
   -webkit-backdrop-filter: blur(24px);
   animation: slideDownFull 0.30s cubic-bezier(0.4,0,0.2,1);
+  /* prevent nav HUD from being taller than 40vh */
+  max-height: 40vh;
 }
 #nav-hud.show { display: block; }
 #nav-hud.arrived {
@@ -736,6 +738,7 @@ input  { font-family: inherit; }
 #route-panel::-webkit-scrollbar { width: 3px; }
 #route-panel::-webkit-scrollbar-thumb { background: var(--muted2); }
 
+
 .panel-header {
   display: flex; align-items: center; justify-content: space-between;
   margin-bottom: 12px; padding-top: 4px; flex-shrink: 0; position: sticky; top: 0;
@@ -887,7 +890,7 @@ input  { font-family: inherit; }
 
   #loader      { top: calc(114px + var(--safe-t)); }
   #scan-status { top: calc(118px + var(--safe-t)); }
-  #nav-hud     { top: calc(112px + var(--safe-t)); }
+  #nav-hud     { top: calc(70px + var(--safe-t)); left: 10px; right: 10px; }
 
   #route-panel  { max-height: 50vh; }
   #map-legend   { bottom: calc(var(--safe-b) + 56px); right: 10px; }
@@ -910,11 +913,13 @@ input  { font-family: inherit; }
   #nav-btn      { padding: 0 14px; height: 44px; }
   .nav-btn-text { display: none; }
 
-  /* Nav HUD — full width at bottom during nav */
+  /* Nav HUD stays at top on mobile too (below topbar) */
   #nav-hud {
-    top: auto;
-    bottom: calc(var(--safe-b) + 140px);
-    border-radius: var(--r-xl);
+    top: calc(var(--topbar-h) + var(--safe-t) + 6px);
+    bottom: auto;
+    left: 8px; right: 8px;
+    border-radius: var(--r-lg);
+    max-height: 38vh;
   }
   .nav-direction-bar { padding: 12px 14px 8px; }
   .nav-direction-arrow { width: 40px; height: 40px; font-size: 1.35rem; }

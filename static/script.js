@@ -281,14 +281,14 @@ const userIcon = L.divIcon({
 
 /** Navigation arrow — rotates with smoothed heading */
 function makeNavArrowIcon(heading, offRoute) {
-  const deg = heading || 0;
+  const deg = (heading != null && isFinite(heading)) ? heading : 0;
   const cls = offRoute ? 'off-route' : '';
   return L.divIcon({
     className: '',
     html: `<div class="m-nav-arrow ${cls}" style="transform:rotate(${deg}deg)">
              <div class="m-nav-chevron"></div>
            </div>`,
-    iconSize: [40, 40], iconAnchor: [20, 20],
+    iconSize: [44, 44], iconAnchor: [22, 22],
   });
 }
 
@@ -387,11 +387,11 @@ function _startWatchingGPS() {
     enableHighAccuracy: false, timeout: 8000, maximumAge: 10000,
   });
 
-  // High-accuracy watch — smaller maximumAge forces fresh fixes
+  // High-accuracy continuous watch — maximumAge:0 forces fresh fixes every time
   _gpsWatchId = navigator.geolocation.watchPosition(onGPSFix, onGPSError, {
     enableHighAccuracy: true,
-    timeout:            20000,
-    maximumAge:         0,      // always want fresh position
+    timeout:            15000,
+    maximumAge:         0,
   });
 }
 
@@ -400,20 +400,19 @@ function onGPSFix(pos) {
   const rawLon    = pos.coords.longitude;
   const now       = pos.timestamp || Date.now();
 
-  // Sanitize accuracy — ignore impossibly large values (GPS not locked yet)
+  // Sanitize accuracy
   let acc = pos.coords.accuracy;
   if (!isFinite(acc) || acc <= 0 || acc > 50000) acc = 9999;
 
-  // Reject positions with accuracy worse than 1000m (wildly inaccurate)
-  // unless it's our very first fix
-  if (acc > 1000 && userLat !== null) {
+  // Reject only wildly inaccurate fixes after first lock
+  if (acc > 2000 && userLat !== null) {
     setGpsPill(`⌛ Weak (±${Math.round(acc)}m)`, 'loading');
     return;
   }
 
-  /* ── Kalman smooth position ─────────────────────────────────── */
-  _kfLat.setAccuracy(acc);
-  _kfLon.setAccuracy(acc);
+  /* ── Kalman smooth position — use higher Q so position tracks movement ── */
+  _kfLat.setAccuracy(Math.min(acc, 300));
+  _kfLon.setAccuracy(Math.min(acc, 300));
   const lat = _kfLat.update(rawLat);
   const lon = _kfLon.update(rawLon);
 
@@ -423,36 +422,34 @@ function onGPSFix(pos) {
 
   let speedKmh = 0;
   if (gpsSpeed !== null && gpsSpeed !== undefined && isFinite(gpsSpeed) && gpsSpeed >= 0) {
-    speedKmh = gpsSpeed * 3.6;  // m/s → km/h
+    speedKmh = gpsSpeed * 3.6;   // m/s → km/h
   } else if (_prevRawLat !== null && _lastGpsTs !== null) {
-    const dt = (now - _lastGpsTs) / 1000;  // seconds
-    if (dt > 0 && dt < 30) {
+    const dt = (now - _lastGpsTs) / 1000;
+    if (dt > 0 && dt < 60) {
       const dm = _haversineJS(_prevRawLat, _prevRawLon, rawLat, rawLon);
       speedKmh = (dm / dt) * 3.6;
     }
   }
-  // Cap unrealistic speeds (GPS glitches)
   speedKmh = Math.min(speedKmh, 200);
 
-  // Rolling average over last 4 samples for smoother readout
+  // Rolling average over last 5 samples
   _navSpeedHistory.push(speedKmh);
-  if (_navSpeedHistory.length > 4) _navSpeedHistory.shift();
+  if (_navSpeedHistory.length > 5) _navSpeedHistory.shift();
   userSpeedKmh = _navSpeedHistory.reduce((a, b) => a + b, 0) / _navSpeedHistory.length;
 
-  /* ── Heading smoothing ──────────────────────────────────────── */
+  /* ── Heading — accept GPS heading at any speed > 0.5 km/h ── */
   let rawBearing = null;
-  if (gpsHeading !== null && gpsHeading !== undefined && !isNaN(gpsHeading) && speedKmh > 2) {
+  if (gpsHeading !== null && gpsHeading !== undefined && isFinite(gpsHeading) && !isNaN(gpsHeading) && speedKmh > 0.5) {
     rawBearing = gpsHeading;
   } else if (_prevRawLat !== null &&
-             (Math.abs(rawLat - _prevRawLat) > 3e-6 || Math.abs(rawLon - _prevRawLon) > 3e-6)) {
+             (Math.abs(rawLat - _prevRawLat) > 1e-6 || Math.abs(rawLon - _prevRawLon) > 1e-6)) {
     rawBearing = _bearingDeg(_prevRawLat, _prevRawLon, rawLat, rawLon);
   }
 
   if (rawBearing !== null) {
-    _rawHeading  = rawBearing;
-    // Faster smoothing when speed is higher; slower when creeping
-    const alpha  = Math.min(0.45, Math.max(0.12, speedKmh / 120));
-    userHeading  = _smoothBearing(userHeading, rawBearing, alpha);
+    _rawHeading = rawBearing;
+    const alpha = Math.min(0.55, Math.max(0.15, speedKmh / 80));
+    userHeading = _smoothBearing(userHeading, rawBearing, alpha);
   }
 
   _prevRawLat = rawLat;
@@ -463,12 +460,10 @@ function onGPSFix(pos) {
   userLat = lat;
   userLon = lon;
 
-  // Display accuracy — cap display at 999m, show as >999m if worse
+  // GPS pill display
   const accDisplay = acc >= 9999 ? '>999' : `±${Math.round(acc)}`;
   const pillClass  = acc < 30 ? 'ok' : acc < 100 ? 'medium' : 'error';
-  const pillLabel  = acc < 30 ? `📡 ${accDisplay}m` :
-                     acc < 100 ? `📡 ${accDisplay}m` :
-                     acc < 9999 ? `⚠ ${accDisplay}m` : '⌛ Locating…';
+  const pillLabel  = acc < 9999 ? `📡 ${accDisplay}m` : '⌛ Locating…';
   setGpsPill(pillLabel, pillClass);
 
   gpsHUD.className = acc < 100 ? 'ok' : '';
@@ -484,10 +479,17 @@ function onGPSFix(pos) {
 
     if (_firstFix) {
       _firstFix = false;
-      map.flyTo([lat, lon], 14, { duration: 1.8, easeLinearity: 0.4 });
+      map.flyTo([lat, lon], 15, { duration: 1.6, easeLinearity: 0.4 });
     }
   } else {
-    userMarker.setLatLng([lat, lon]).setPopupContent(buildLocationPopup(lat, lon, acc));
+    // Always update marker position on every fix
+    userMarker.setLatLng([lat, lon]);
+    userMarker.setPopupContent(buildLocationPopup(lat, lon, acc));
+  }
+
+  // Keep map centered on user when not navigating and not panned away
+  if (!_navActive && _navCentering) {
+    map.panTo([lat, lon], { animate: true, duration: 0.5, easeLinearity: 0.5 });
   }
 
   if (_navActive) {
@@ -524,7 +526,8 @@ function fallbackGPS() {
 
 if (myLocBtn) myLocBtn.addEventListener('click', () => {
   if (userLat !== null) {
-    map.flyTo([userLat, userLon], Math.max(map.getZoom(), 15), { duration: 1.2 });
+    _navCentering = true;   // re-enable auto-follow
+    map.flyTo([userLat, userLon], Math.max(map.getZoom(), 16), { duration: 1.0 });
     if (userMarker) userMarker.openPopup();
   } else {
     showError('Location not yet available. Please allow location access.', 4000);
@@ -624,7 +627,7 @@ function stopNavigation(showMsg = true) {
 function _onNavGPSUpdate(lat, lon, acc) {
   if (!_navActive || !_navLls.length) return;
 
-  /* Update arrow position + rotation */
+  /* Update nav arrow position + rotation */
   if (_navArrow) {
     _navArrow.setLatLng([lat, lon]);
     if (userHeading !== null) {
@@ -635,7 +638,7 @@ function _onNavGPSUpdate(lat, lon, acc) {
   /* Update direction arrow in HUD */
   if (userHeading !== null) _updateDirectionArrow(userHeading);
 
-  /* Update live speed */
+  /* Update live speed in HUD */
   if (navSpeedVal) {
     navSpeedVal.textContent = Math.round(userSpeedKmh);
   }
@@ -646,22 +649,29 @@ function _onNavGPSUpdate(lat, lon, acc) {
     _navArrowTrail.setLatLngs(_navTravelledLls);
   }
 
-  /* Auto-center map */
+  /* Auto-center map on user position during navigation */
   if (_navCentering) {
-    map.panTo([lat, lon], { animate: true, duration: 0.4, easeLinearity: 0.6 });
+    if (_navTravelledLls.length <= 2) {
+      // First update after nav start — fly to position at nav zoom
+      map.flyTo([lat, lon], 17, { duration: 1.0, easeLinearity: 0.5 });
+    } else {
+      map.panTo([lat, lon], { animate: true, duration: 0.35, easeLinearity: 0.6 });
+    }
   }
 
-  /* Off-route detection */
-  const nearest = _nearestPointOnRoute(lat, lon, _navLls);
-  const distToRoute = _haversineJS(lat, lon, nearest.lat, nearest.lon);
-  if (distToRoute > 80 && acc < 60) {
-    _navOffRouteCount++;
-    if (_navOffRouteCount >= 3) {
+  /* Off-route detection — only trigger if GPS is reliable */
+  if (acc < 80) {
+    const nearest = _nearestPointOnRoute(lat, lon, _navLls);
+    const distToRoute = _haversineJS(lat, lon, nearest.lat, nearest.lon);
+    if (distToRoute > 80) {
+      _navOffRouteCount++;
+      if (_navOffRouteCount >= 4) {
+        _navOffRouteCount = 0;
+        _promptReroute(lat, lon);
+      }
+    } else {
       _navOffRouteCount = 0;
-      _promptReroute(lat, lon);
     }
-  } else {
-    _navOffRouteCount = 0;
   }
 
   _updateNavHUD(lat, lon);
@@ -678,9 +688,9 @@ function _updateNavHUD(lat, lon) {
 
   const distM = _remainingDistOnRoute(lat, lon, _navLls);
 
-  /* ETA: prefer live speed if > 3 km/h, otherwise fallback to 25 km/h */
-  const speedForEta = userSpeedKmh > 3 ? userSpeedKmh : 25;
-  const timeMin = Math.round((distM / 1000) / speedForEta * 60);
+  /* ETA: use live speed if > 5 km/h, else fallback to 30 km/h (city average) */
+  const speedForEta = userSpeedKmh > 5 ? userSpeedKmh : 30;
+  const timeMin = Math.max(1, Math.round((distM / 1000) / speedForEta * 60));
 
   if (navHudDist) navHudDist.textContent = distM < 1000
     ? `${Math.round(distM)}m` : `${(distM / 1000).toFixed(1)}km`;
@@ -768,7 +778,9 @@ function _projectPointOnSegment(pLat, pLon, aLat, aLon, bLat, bLon) {
 }
 
 if (navStopBtn) navStopBtn.addEventListener('click', () => stopNavigation(true));
-map.on('dragstart', () => { if (_navActive) _navCentering = false; });
+// Dragging pauses auto-follow; tapping "my location" FAB re-enables it
+map.on('dragstart', () => { _navCentering = false; });
+map.on('zoomstart', () => { if (!_navActive) _navCentering = false; });
 
 /* ================================================================
    Autocomplete Suggestions
