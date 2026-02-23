@@ -51,5 +51,14 @@ SmartNav-AI operates on a client-side heavy architecture to ensure low latency f
 
 1. **Clone the Repository**
    ```bash
-   git clone [https://github.com/Abhijit9999908/smartnav-ai.git](https://github.com/Abhijit9999908/smartnav-ai.git)
-   cd smartnav-ai
+   # Clone repository
+git clone https://github.com/Abhijit9999908/smartnav-ai.git
+
+# Navigate to project folder
+cd smartnav-ai
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the application
+python app.py
