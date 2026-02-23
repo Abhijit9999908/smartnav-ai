@@ -3,6 +3,9 @@
 
 [![Live Demo](https://img.shields.io/badge/Demo-Live%20on%20Render-brightgreen?style=for-the-badge)](https://smartnav-ai.onrender.com)
 [![GitHub](https://img.shields.io/badge/GitHub-Repo-blue?style=for-the-badge&logo=github)](https://github.com/Abhijit9999908/smartnav-ai)
+[![Download APK](https://img.shields.io/badge/Download-SmartNav.apk-orange?style=for-the-badge&logo=android)](https://github.com/Abhijit9999908/smartnav-ai/releases/latest/download/SmartNav.apk)
+
+> 📱 **Android App** — Download the APK above, enable *Install unknown apps* in your phone settings, then tap the file to install.
 
 **SmartNav-AI** is a lightweight, responsive web application that brings native-app GPS capabilities to the browser. By leveraging the Browser Geolocation API and Leaflet.js, it provides live movement tracking, route visualization, and real-time ETA calculations without the need for heavy installations.
 
