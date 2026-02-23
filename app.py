@@ -25,7 +25,7 @@ from scoring_engine import score_routes
 app = Flask(__name__)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-CORS(app, resources={r"/*": {"origins": []}})
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ── Rate limiting ──────────────────────────────────────────────────────────────
 limiter = Limiter(
@@ -69,8 +69,9 @@ csp = {
 
 Talisman(
     app,
-    force_https=False,               # Render handles HTTPS at the proxy level
-    strict_transport_security=False, # Let Render's proxy set HSTS
+    force_https=False,                       # Render terminates TLS at its proxy
+    force_https_permanent=False,
+    strict_transport_security=False,          # Render sets HSTS at edge
     content_security_policy=csp,
     permissions_policy={
         "geolocation": "(self)",
@@ -80,6 +81,8 @@ Talisman(
     referrer_policy="strict-origin-when-cross-origin",
     x_content_type_options=True,
     x_xss_protection=True,
+    session_cookie_secure=False,             # No session cookies used, avoid errors
+    session_cookie_http_only=True,
 )
 
 
