@@ -92,10 +92,6 @@ It demonstrates how real-world sensor data (GPS coordinates) can be processed an
 👨‍💻 Author
 -- Developed by Abhijit Rathod
 
-## 📱 Download Android App
-
-[![Download APK](https://img.shields.io/badge/Download-SmartNav.apk-brightgreen?style=for-the-badge&logo=android)](https://github.com/Abhijit9999908/smartnav-ai/releases/latest/download/SmartNav.apk)
-
 > Install on Android: enable "Install unknown apps" in Settings, then open the downloaded APK.
 
 Contributions and feedback are welcome! Feel free to open an issue or submit a pull request.
