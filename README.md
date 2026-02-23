@@ -76,17 +76,17 @@ http://localhost:5000
 🎯 Why This Project Matters
 SmartNav-AI is a practical implementation of:
 
-Asynchronous JavaScript
+- Asynchronous JavaScript
 
-RESTful API architecture
+- RESTful API architecture
 
-Real-time GPS data handling
+- Real-time GPS data handling
 
-Interactive mapping systems
+- Interactive mapping systems
 
 It demonstrates how real-world sensor data (GPS coordinates) can be processed and translated into a meaningful, responsive user interface—a core skill for modern full-stack developers.
 
 👨‍💻 Author
-Developed by Abhijit Rathod
+-- Developed by Abhijit Rathod
 
 Contributions and feedback are welcome! Feel free to open an issue or submit a pull request.
