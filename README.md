@@ -41,41 +41,52 @@ SmartNav-AI operates on a client-side heavy architecture to ensure low latency f
 
 ---
 
-## ⚡ Quick Start
+### ⚙️ Installation
 
-### Prerequisites
-* Python 3.x
-* A modern browser (Chrome, Firefox, or Safari) with Location Services enabled.
-
-### Installation
-
-1. **Clone the Repository**
-   ```bash
-   git clone [https://github.com/Abhijit9999908/smartnav-ai.git](https://github.com/Abhijit9999908/smartnav-ai.git)
-
-   Navigate to Project Folder
-
-### 2. Navigate to Project Folder
 ```bash
+# 1. Clone the repo
+git clone https://github.com/Abhijit9999908/smartnav-ai.git
+
+# 2. Change directory
 cd smartnav-ai
-Install Dependencies
 
-Bash
+# 3. Install dependencies
 pip install -r requirements.txt
-Run the Application
 
-Bash
+# 4. Start the app
 python app.py
+
+```
+
+🌐 Accessing the App
+Once the server is running, open your browser and go to:
+http://localhost:5000
+
+⚠️ Important: You must click "Allow" when the browser asks for location permissions.
+
 📈 Future Roadmap
-[ ] Voice-Guided Navigation: Integration with Web Speech API for hands-free directions.
+[ ] 🎤 Voice-Guided Navigation: Integration with Web Speech API for hands-free directions.
 
-[ ] AI Route Optimization: Using machine learning to suggest routes based on historical traffic data.
+[ ] 🤖 AI Route Optimization: Use machine learning to suggest smarter routes based on traffic patterns.
 
-[ ] Offline Mode: Service Worker integration for map caching in low-signal areas.
+[ ] 📶 Offline Mode: Service Worker integration for map caching in low-signal areas.
 
-[ ] Multi-Stop Routing: Ability to add waypoints between start and destination.
+[ ] 📍 Multi-Stop Routing: Add waypoints between start and destination.
 
 🎯 Why This Project Matters
-This project serves as a practical implementation of asynchronous JavaScript and RESTful API design. It demonstrates how to handle real-world sensor data (GPS) and translate it into a meaningful user interface—a core skill for modern full-stack developers.
+SmartNav-AI is a practical implementation of:
 
-Developed by [Abhijit] Contributions and feedback are welcome! Feel free to open an issue or submit a pull request.
+Asynchronous JavaScript
+
+RESTful API architecture
+
+Real-time GPS data handling
+
+Interactive mapping systems
+
+It demonstrates how real-world sensor data (GPS coordinates) can be processed and translated into a meaningful, responsive user interface—a core skill for modern full-stack developers.
+
+👨‍💻 Author
+Developed by Abhijit Rathod
+
+Contributions and feedback are welcome! Feel free to open an issue or submit a pull request.
