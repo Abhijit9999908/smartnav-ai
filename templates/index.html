@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#060b13" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="SmartNav" />
+  <meta name="format-detection" content="telephone=no" />
+  <title>SmartNav AI</title>
+
+  <!-- Preconnect for faster tile loading -->
+  <link rel="preconnect" href="https://a.basemaps.cartocdn.com" crossorigin />
+  <link rel="preconnect" href="https://b.basemaps.cartocdn.com" crossorigin />
+  <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+  <!-- ── HTTPS BANNER ─────────────────────────────────────── -->
+  <div id="https-banner" class="hidden">
+    <div class="https-inner">
+      <span class="https-icon">🔒</span>
+      <div class="https-text">
+        <strong>GPS requires HTTPS.</strong> You are on HTTP — Chrome blocks location.
+        Open <code id="https-url"></code> → tap <strong>Advanced → Proceed</strong>.
+      </div>
+      <button class="https-close" onclick="document.getElementById('https-banner').classList.add('hidden')" aria-label="Dismiss">✕</button>
+    </div>
+  </div>
+
+  <!-- ── LOCATION PERMISSION SCREEN ───────────────────────── -->
+  <div id="location-prompt" class="hidden" role="dialog" aria-modal="true" aria-label="Location permission">
+    <div class="lp-backdrop"></div>
+    <div class="lp-sheet">
+      <div class="lp-handle"></div>
+      <div class="lp-icon-wrap">
+        <div class="lp-icon-ring">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="3" fill="#4f9eff"/>
+            <path d="M12 2v3M12 19v3M2 12h3M19 12h3" stroke="#4f9eff" stroke-width="2" stroke-linecap="round"/>
+            <circle cx="12" cy="12" r="7" stroke="#4f9eff" stroke-width="1.5" stroke-dasharray="3 3"/>
+          </svg>
+        </div>
+      </div>
+      <div class="lp-title">Enable Location</div>
+      <div class="lp-desc">SmartNav AI needs your GPS to show real-time routes and track your journey.</div>
+      <div class="lp-steps">
+        <div class="lp-step"><span class="lp-step-num">1</span><span>Tap <strong>Allow Location</strong> below</span></div>
+        <div class="lp-step"><span class="lp-step-num">2</span><span>When Chrome asks, tap <strong>Allow</strong></span></div>
+        <div class="lp-step"><span class="lp-step-num">3</span><span>Your live position appears on the map</span></div>
+      </div>
+      <div class="lp-actions">
+        <button id="lp-allow" class="lp-btn lp-btn-allow">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
+          Allow Location Access
+        </button>
+        <button id="lp-deny" class="lp-btn lp-btn-deny">Use Default (Delhi)</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── MAP ───────────────────────────────────────────────── -->
+  <div id="map" role="application" aria-label="Navigation map"></div>
+
+  <!-- ── TOP SEARCH BAR ────────────────────────────────────── -->
+  <header id="topbar">
+    <div class="topbar-inner">
+      <div class="logo" aria-label="SmartNav AI">
+        <div class="logo-icon" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+            <path d="M12 2L3 9v11a1 1 0 001 1h5v-6h6v6h5a1 1 0 001-1V9L12 2z" fill="#4f9eff" opacity="0.9"/>
+            <circle cx="12" cy="8" r="2" fill="#fff" opacity="0.9"/>
+          </svg>
+        </div>
+        <span class="logo-name">SmartNav<span class="logo-ai"> AI</span></span>
+      </div>
+
+      <form id="search-form" autocomplete="off" role="search" aria-label="Search destination">
+        <div class="search-box">
+          <span class="search-icon" aria-hidden="true">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>
+          </span>
+          <input
+            id="dest-input"
+            type="search"
+            placeholder="Where to? or 'coffee near me'"
+            autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+            aria-label="Search destination"
+            aria-autocomplete="list"
+            aria-controls="suggestions-list"
+            aria-expanded="false"
+            inputmode="search"
+            enterkeyhint="search"
+          />
+          <button type="button" id="clear-btn" class="clear-btn" aria-label="Clear search" tabindex="-1">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <button id="nav-btn" type="submit" aria-label="Navigate" title="Find routes">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          <span class="nav-btn-text">GO</span>
+        </button>
+      </form>
+
+      <div id="gps-pill" class="loading" aria-live="polite" role="status" title="GPS accuracy">
+        <span class="gps-dot"></span>
+        <span id="gps-pill-text">Locating…</span>
+      </div>
+    </div>
+
+    <!-- Autocomplete dropdown -->
+    <ul id="suggestions-list" class="suggestions hidden" role="listbox" aria-label="Search suggestions"></ul>
+  </header>
+
+  <!-- ── LOADER PILL ────────────────────────────────────────── -->
+  <div id="loader" role="status" aria-live="polite" aria-label="Loading">
+    <div class="loader-inner">
+      <svg class="loader-ring" viewBox="0 0 32 32">
+        <circle cx="16" cy="16" r="12" fill="none" stroke="rgba(79,158,255,0.15)" stroke-width="3"/>
+        <circle cx="16" cy="16" r="12" fill="none" stroke="#4f9eff" stroke-width="3"
+                stroke-dasharray="60" stroke-dashoffset="45" stroke-linecap="round"/>
+      </svg>
+      <span id="loader-step">Loading…</span>
+      <div class="loader-bar"><div id="loader-progress-fill" class="loader-bar-fill"></div></div>
+    </div>
+  </div>
+
+  <!-- ── TOASTS ─────────────────────────────────────────────── -->
+  <div id="error-msg"  role="alert"  aria-live="assertive" aria-atomic="true"></div>
+  <div id="info-msg"   role="status" aria-live="polite"    aria-atomic="true"></div>
+
+  <!-- ── SCAN STATUS PILL ───────────────────────────────────── -->
+  <div id="scan-status" class="hidden" aria-live="polite" role="status"></div>
+
+  <!-- ── LIVE NAV HUD (Android-style) ─────────────────────── -->
+  <div id="nav-hud" role="region" aria-label="Navigation info" aria-live="polite">
+    <!-- Direction arrow banner -->
+    <div class="nav-direction-bar">
+      <div class="nav-direction-arrow" id="nav-direction-arrow" aria-hidden="true">↑</div>
+      <div class="nav-direction-text" id="nav-hud-street">Starting navigation…</div>
+    </div>
+
+    <!-- Speed + metrics row -->
+    <div class="nav-metrics-row">
+      <div class="nav-metric-block">
+        <div class="nav-metric-val" id="nav-hud-dist">—</div>
+        <div class="nav-metric-lbl">REMAINING</div>
+      </div>
+      <div class="nav-speed-block" id="nav-speed-block" aria-label="Current speed">
+        <div class="nav-speed-val" id="nav-speed-val">0</div>
+        <div class="nav-speed-unit">km/h</div>
+      </div>
+      <div class="nav-metric-block nav-metric-right">
+        <div class="nav-metric-val" id="nav-hud-time">—</div>
+        <div class="nav-metric-lbl">ETA</div>
+      </div>
+    </div>
+
+    <button id="nav-stop-btn" class="nav-stop-btn" aria-label="Stop navigation">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+      Stop Navigation
+    </button>
+  </div>
+
+  <!-- ── POI PANEL ──────────────────────────────────────────── -->
+  <div id="poi-panel" class="hidden" role="region" aria-label="Nearby places">
+    <div class="sheet-handle"></div>
+    <div class="poi-header">
+      <span class="poi-title" id="poi-title">Nearby</span>
+      <span class="poi-count" id="poi-count"></span>
+      <button id="poi-close" class="icon-close-btn" aria-label="Close nearby panel">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div id="poi-list" class="poi-list"></div>
+  </div>
+
+  <!-- ── MAP LEGEND ─────────────────────────────────────────── -->
+  <div id="map-legend" class="hidden" aria-label="Route legend">
+    <div class="legend-title">ROUTES</div>
+    <div id="legend-items"></div>
+  </div>
+
+  <!-- ── GPS DEBUG HUD (hidden on phones) ──────────────────── -->
+  <div id="gps-coords" aria-live="polite" aria-label="GPS coordinates">NO GPS</div>
+
+  <!-- ── FAB BUTTONS ────────────────────────────────────────── -->
+  <div class="fab-stack">
+    <button id="map-toggle-btn" class="fab-btn" title="Toggle map style" aria-label="Toggle map style" onclick="_toggleMapStyle()">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M2 12h2M20 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+    </button>
+    <button id="my-location-btn" class="fab-btn fab-btn-primary" title="My location" aria-label="Center on my location">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3" fill="currentColor" opacity="0.6"/>
+        <path d="M12 2v4M12 18v4M4 12H2M22 12h-2"/>
+        <circle cx="12" cy="12" r="9" stroke-dasharray="4 3"/>
+      </svg>
+    </button>
+  </div>
+
+  <!-- ── ROUTE PANEL (bottom sheet) ────────────────────────── -->
+  <section id="route-panel" aria-label="Route options">
+    <div class="sheet-handle" id="panel-handle"></div>
+    <div class="panel-header">
+      <div class="panel-header-left">
+        <span class="panel-title">ROUTE ANALYSIS</span>
+        <span id="route-count-badge" class="count-badge"></span>
+      </div>
+      <div class="panel-header-right">
+        <button id="panel-expand" class="icon-btn" title="Expand panel" aria-label="Expand panel">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+        </button>
+        <button id="close-panel" class="icon-btn icon-btn-close" title="Close" aria-label="Close route panel">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+    </div>
+    <div id="cards-wrap" role="list" aria-label="Route options"></div>
+  </section>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="/static/script.js"></script>
+</body>
+</html>
