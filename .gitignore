@@ -19,7 +19,10 @@ env/
 .venv/
 .env/
 
-# Local certs (never commit private keys)
+# mkcert binary
+mkcert
+
+# Byte-compiled certs (never commit private keys)
 certs/
 
 # Byte-compiled
