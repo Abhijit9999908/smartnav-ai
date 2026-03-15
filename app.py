@@ -113,6 +113,17 @@ def create_app() -> Flask:
         headers_enabled=True,
     )
 
+    # Warn operators when running multi-worker Gunicorn with in-memory limiter
+    if _RATE_LIMIT_STORAGE_URI == "memory://":
+        import sys
+        # sys.argv[0] will be 'gunicorn' when launched via Gunicorn
+        if "gunicorn" in sys.argv[0].lower():
+            log.warning(
+                "Rate-limiter is using in-memory storage with Gunicorn. "
+                "Set RATELIMIT_STORAGE_URI to a Redis URL for accurate "
+                "cross-worker rate limiting in production."
+            )
+
     # ── Security headers ───────────────────────────────────────────────────
     # force_https=False: Render terminates TLS at its load-balancer and
     # forwards plain HTTP to the container, so redirecting to HTTPS here
@@ -384,6 +395,10 @@ def _register_routes(application: Flask, limiter: Limiter) -> None:
     @application.errorhandler(405)
     def method_not_allowed_handler(exc):            # noqa: ANN001,ANN202
         return jsonify({"error": "Method not allowed."}), 405
+
+    @application.errorhandler(400)
+    def bad_request_handler(exc):                   # noqa: ANN001,ANN202
+        return jsonify({"error": "Bad request."}), 400
 
     @application.errorhandler(500)
     def internal_error_handler(exc):               # noqa: ANN001,ANN202

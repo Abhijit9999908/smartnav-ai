@@ -136,6 +136,24 @@ _osrm_session.mount("https://", _osrm_adapter)
 _osrm_session.mount("http://",  _osrm_adapter)
 
 # ---------------------------------------------------------------------------
+# Nominatim rate-limit throttle  (policy: max 1 req / s)
+# ---------------------------------------------------------------------------
+_nominatim_lock = Lock()
+_nominatim_last_ts: float = 0.0
+_NOMINATIM_MIN_INTERVAL = 1.1   # seconds between Nominatim requests
+
+
+def _nominatim_throttle() -> None:
+    """Block until at least ``_NOMINATIM_MIN_INTERVAL`` s since the last Nominatim call."""
+    global _nominatim_last_ts
+    with _nominatim_lock:
+        now = time.monotonic()
+        elapsed = now - _nominatim_last_ts
+        if elapsed < _NOMINATIM_MIN_INTERVAL:
+            time.sleep(_NOMINATIM_MIN_INTERVAL - elapsed)
+        _nominatim_last_ts = time.monotonic()
+
+# ---------------------------------------------------------------------------
 # Lightweight TTL caches (reduce upstream API churn)
 # ---------------------------------------------------------------------------
 
@@ -437,6 +455,7 @@ def get_city_name(lat: float, lon: float) -> Optional[str]:
     across sessions; callers that need caching should wrap this themselves.
     """
     try:
+        _nominatim_throttle()
         r = _session.get(
             NOMINATIM_REVERSE,
             params={
@@ -843,6 +862,7 @@ def _nominatim_nearby(keyword: str, lat: float, lon: float,
     """
     deg_offset = max(radius_m / 111_000, 0.05)
     try:
+        _nominatim_throttle()
         r = _session.get(
             NOMINATIM_BASE,
             params={
@@ -953,6 +973,7 @@ def get_suggestions(query: str,
             params["viewbox"] = f"{lon - 2},{lat + 2},{lon + 2},{lat - 2}"
             params["bounded"] = 0
 
+        _nominatim_throttle()
         r = _session.get(NOMINATIM_BASE, params=params, timeout=10)
         r.raise_for_status()
 
@@ -1029,6 +1050,7 @@ def geocode(place_name: str,
                    f"{user_lon + box},{user_lat - box}")
         for bounded in (1, 0):
             try:
+                _nominatim_throttle()
                 r = _session.get(
                     NOMINATIM_BASE,
                     params={
@@ -1070,6 +1092,7 @@ def geocode(place_name: str,
 
     # 2. Nominatim India-restricted
     try:
+        _nominatim_throttle()
         r = _session.get(
             NOMINATIM_BASE,
             params={
@@ -1106,6 +1129,7 @@ def geocode(place_name: str,
 
     # 3. Nominatim global (India bbox guard)
     try:
+        _nominatim_throttle()
         r = _session.get(
             NOMINATIM_BASE,
             params={
@@ -1145,6 +1169,35 @@ def geocode(place_name: str,
             log.debug("geocode  Nominatim-global results outside India or low-confidence")
     except Exception as exc:
         log.warning("geocode  Nominatim-global failed: %s", exc)
+
+    # 3.5 Nominatim India-restricted + Maharashtra Context Injection
+    # If the user is roughly in India, let's inject ", Maharashtra, India" to force Nominatim
+    # to hunt deep into the sub-region data when a generic text search drops the ball.
+    if user_lat is not None and user_lon is not None:
+        if INDIA_LAT_MIN <= user_lat <= INDIA_LAT_MAX and INDIA_LON_MIN <= user_lon <= INDIA_LON_MAX:
+            try:
+                maha_query = f"{place_name}, Maharashtra, India"
+                params = {
+                    "q":              maha_query,
+                    "format":         "json",
+                    "limit":          1,
+                    "countrycodes":   "in",
+                    "addressdetails": 0,
+                }
+                _nominatim_throttle()
+                r = _session.get(NOMINATIM_BASE, params=params, timeout=TIMEOUT)
+                r.raise_for_status()
+                maha_res = r.json()
+                if maha_res:
+                    item = maha_res[0]
+                    log.debug("geocode  '%s' via Nominatim Maharashtra-context", place_name)
+                    return _cache_return(_GEOCODE_CACHE, cache_key, {
+                        "lat": float(item["lat"]),
+                        "lon": float(item["lon"]),
+                        "src": "nom_maha_context"
+                    })
+            except Exception as exc:
+                log.warning("geocode  Nominatim Maharashtra-context failed: %s", exc)
 
     # 4. Photon (Komoot) — final fallback
     try:
@@ -1490,8 +1543,10 @@ def fetch_routes(start_lat: float, start_lon: float,
         start_lat, start_lon = f_start.result()
         end_lat,   end_lon   = f_end.result()
 
-    dist_km = math.sqrt((end_lat - start_lat) ** 2 +
-                        (end_lon - start_lon) ** 2) * 111.0
+    mid_lat_rad = math.radians((start_lat + end_lat) / 2.0)
+    dlat = end_lat - start_lat
+    dlon = (end_lon - start_lon) * math.cos(mid_lat_rad)
+    dist_km = math.sqrt(dlat ** 2 + dlon ** 2) * 111.0
     deadline = time.monotonic() + _OSRM_TOTAL_BUDGET
 
     log.debug("fetch_routes  estimated distance: %.1f km", dist_km)

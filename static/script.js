@@ -131,6 +131,7 @@ function _storeMapMode(styleId) {
 let _mapMode = _readStoredMapMode() || 'night';
 let _mapBaseLayer = null;
 let _tileErrCount = 0;
+let _tileFallbackInProgress = false;
 
 function _buildMapBaseLayer(styleId) {
     const styleDef = MAP_STYLE_DEFS[styleId] || MAP_STYLE_DEFS.liberty;
@@ -208,8 +209,10 @@ function _applyMapStyle(styleId) {
 
     if (styleDef.engine === 'raster' && _mapBaseLayer?.on) {
         _mapBaseLayer.on('tileerror', () => {
+            if (_tileFallbackInProgress) return;
             _tileErrCount++;
             if (_tileErrCount > 5) {
+                _tileFallbackInProgress = true;
                 _applyMapStyle('liberty');
             }
         });
@@ -1021,6 +1024,7 @@ if (lpDeny) lpDeny.addEventListener('click', () => {
 if (httpsCloseBtn) httpsCloseBtn.addEventListener('click', () => {
     if (httpsBanner) {
         httpsBanner.classList.add('hidden');
+        document.body.classList.remove('has-banner');
     }
 });
 
@@ -1856,7 +1860,7 @@ function _haversineJS(lat1, lon1, lat2, lon2) {
     const R = 6371000;
     const p1 = lat1 * Math.PI / 180, p2 = lat2 * Math.PI / 180;
     const dp = (lat2 - lat1) * Math.PI / 180, dl = (lon2 - lon1) * Math.PI / 180;
-    const a = Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
+    const a = Math.min(1, Math.max(0, Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2));
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
@@ -2613,6 +2617,8 @@ async function renderPOIResults(results, keyword, uLat, uLon) {
 
     _poiBounds = bounds;
     _updateOverviewButtonVisibility();
+    routePanel.classList.remove('show', 'expanded'); // Prevent overlap
+    clearRoutes(); // Prevent overlapping polylines
     poiPanel.classList.remove('hidden');
     _syncFloatingUiState();
     fitBoundsNow(bounds, false, true);
@@ -3417,45 +3423,52 @@ function _3dmBuildings(map) {
     const oAnim = ['interpolate',['linear'],['zoom'],13,0,14.5,1];
 
     try {
-        // Layer 1: Offset ground shadow
+        map.setLight({
+            anchor: 'viewport',
+            color: 'hsl(210, 50%, 90%)',
+            position: [1.15, 210, 40], // Light azimuth and elevation casting deep dramatic shadows
+            intensity: 0.55
+        });
+
+        // Layer 1: Offset ground shadow (ambient occlusion trick)
         map.addLayer({ id:'_3bs', source:sk, 'source-layer':'building', type:'fill-extrusion', minzoom:13,
             paint:{
-                'fill-extrusion-color':'#010305',
+                'fill-extrusion-color':'#020409',
                 'fill-extrusion-height':hExpr, 'fill-extrusion-base':bExpr,
-                'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],13,0,14.5,0.60],
-                'fill-extrusion-translate':[5,8], 'fill-extrusion-translate-anchor':'viewport',
+                'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],13,0,14.5,0.75],
+                'fill-extrusion-translate':[6,9], 'fill-extrusion-translate-anchor':'viewport',
             }});
 
-        // Layer 2: Main body — cool blue-navy for India night
+        // Layer 2: Main body — dynamic vertical gradient with richer cyans
         map.addLayer({ id:'_3bm', source:sk, 'source-layer':'building', type:'fill-extrusion', minzoom:13,
             paint:{
                 'fill-extrusion-color':['interpolate',['linear'],['zoom'],
-                    13,'#070f20', 14,'#09152a', 15,'#0c1c34', 16,'#0f2040', 17,'#112448', 18,'#142a52'],
+                    13,'#081226', 14,'#09162e', 15,'#0a1936', 16,'#0e2142', 17,'#102852', 18,'#153266'],
                 'fill-extrusion-height':hAnim, 'fill-extrusion-base':bAnim,
                 'fill-extrusion-opacity':oAnim,
                 'fill-extrusion-vertical-gradient':true,
-                'fill-extrusion-ambient-occlusion-intensity':0.7,
-                'fill-extrusion-ambient-occlusion-radius':4,
+                'fill-extrusion-ambient-occlusion-intensity':1.0, 
+                'fill-extrusion-ambient-occlusion-radius':6,
             }});
 
-        // Layer 3: Tall buildings (>20m) — warm orange-amber face accent
+        // Layer 3: Tall buildings (>20m) — warm copper/amber highlights
         // India has many old structures with warm stone/brick tones
         map.addLayer({ id:'_3ba', source:sk, 'source-layer':'building', type:'fill-extrusion', minzoom:15,
             filter:['>=',['coalesce',['get','height'],0],20],
             paint:{
-                'fill-extrusion-color':'#0e2244',
+                'fill-extrusion-color':'#0c213d',
                 'fill-extrusion-height':hExpr, 'fill-extrusion-base':bExpr,
-                'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],15,0,16.5,0.25],
-                'fill-extrusion-translate':[-2,-2], 'fill-extrusion-translate-anchor':'viewport',
+                'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],15,0,16.5,0.45],
+                'fill-extrusion-translate':[-3,-3], 'fill-extrusion-translate-anchor':'viewport',
             }});
 
-        // Layer 4: Roof caps — thin bright edge at very close zoom
+        // Layer 4: Roof caps — highly luminous neon cyan edge at very close zoom
         map.addLayer({ id:'_3br', source:sk, 'source-layer':'building', type:'fill-extrusion', minzoom:16,
             paint:{
-                'fill-extrusion-color':['interpolate',['linear'],['zoom'],16,'#1a3a66',19,'#2050a0'],
+                'fill-extrusion-color':['interpolate',['linear'],['zoom'],16,'#1e406e',19,'#2a7bff'],
                 'fill-extrusion-height':hExpr,
                 'fill-extrusion-base':['max',['coalesce',['get','height'],0],0.2],
-                'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],15,0,17,0.32,20,0.42],
+                'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],15,0,17,0.4,20,0.65],
             }});
 
     } catch(e) { console.warn('[3D buildings]', e); }
@@ -3941,9 +3954,684 @@ if (!CanvasRenderingContext2D.prototype.roundRect) {
             const port = location.port ? `:${location.port}` : '';
             urlEl.textContent = `https://${host}${port}`;
             httpsBanner.classList.remove('hidden');
+            document.body.classList.add('has-banner');
         }
     }
 })();
 
 _syncNavControls();
 initGPS();
+
+/* ================================================================
+   SMARTNAV UI v13 — Bottom Nav + Pages + AI Routes + Trip History
+================================================================ */
+
+'use strict'; // scoped via closure
+
+(function SmartNavUI() {
+
+/* ── Trip storage (localStorage) ──────────────────────────── */
+const TRIPS_KEY = 'smartnav.trips.v2';
+const PREFS_KEY = 'smartnav.prefs.v1';
+
+function _loadTrips() {
+    try { return JSON.parse(localStorage.getItem(TRIPS_KEY) || '[]'); } catch(_) { return []; }
+}
+
+function _saveTrips(trips) {
+    try { localStorage.setItem(TRIPS_KEY, JSON.stringify(trips.slice(0,100))); } catch(_) {}
+}
+
+function _loadPrefs() {
+    try { return JSON.parse(localStorage.getItem(PREFS_KEY) || '{}'); } catch(_) { return {}; }
+}
+
+function _savePrefs(p) {
+    try { localStorage.setItem(PREFS_KEY, JSON.stringify(p)); } catch(_) {}
+}
+
+/* ── Save a completed/started trip ────────────────────────── */
+function _recordTrip(destText, distKm, durationMin, routeLabel) {
+    const trips = _loadTrips();
+    const now = Date.now();
+    const tags = _inferTripTags(destText, distKm);
+    trips.unshift({
+        id: now,
+        dest: destText || 'Unknown',
+        distKm: Math.round(distKm * 10) / 10,
+        durMin: Math.round(durationMin),
+        ts: now,
+        tags,
+        routeLabel: routeLabel || 'Best Route',
+    });
+    _saveTrips(trips);
+    _renderProfileStats();
+    _renderRecentTrips();
+}
+
+function _inferTripTags(dest, km) {
+    const d = (dest||'').toLowerCase();
+    const tags = [];
+    if (/office|work|tech|hub|corporate|it park|business/.test(d)) tags.push('work');
+    else if (/beach|park|garden|mall|cinema|hotel|resort|lake|hill/.test(d)) tags.push('leisure');
+    else if (/airport|railway|station|bus stand|terminal/.test(d)) tags.push('travel');
+    if (km < 10 && km > 0) tags.push('eco');
+    return tags;
+}
+
+/* ── Stats calculation ─────────────────────────────────────── */
+function _calcStats(trips) {
+    const totalKm = trips.reduce((s, t) => s + (t.distKm||0), 0);
+    const totalHrs = Math.round(trips.reduce((s, t) => s + (t.durMin||0), 0) / 60 * 10) / 10;
+    const aiScore = trips.length > 0 ? Math.min(99, 70 + Math.floor(trips.length * 1.8)) : 0;
+    return { totalKm: Math.round(totalKm * 10)/10, trips: trips.length, totalHrs, aiScore };
+}
+
+/* ── Render profile stats ──────────────────────────────────── */
+function _renderProfileStats() {
+    const trips = _loadTrips();
+    const s = _calcStats(trips);
+    const statDist = document.getElementById('stat-distance');
+    const statTrips = document.getElementById('stat-trips');
+    const statHours = document.getElementById('stat-hours');
+    const statAI = document.getElementById('stat-ai');
+    const actKm = document.getElementById('act-total-km');
+    const actTrips = document.getElementById('act-total-trips');
+    const actHrs = document.getElementById('act-total-hrs');
+    if (statDist)  statDist.innerHTML  = `${s.totalKm} <span class="stat-unit">km</span>`;
+    if (statTrips) statTrips.textContent = s.trips;
+    if (statHours) statHours.innerHTML = `${s.totalHrs} <span class="stat-unit">h</span>`;
+    if (statAI)    statAI.textContent  = `${s.aiScore}%`;
+    if (actKm)     actKm.textContent   = s.totalKm;
+    if (actTrips)  actTrips.textContent = s.trips;
+    if (actHrs)    actHrs.textContent  = s.totalHrs;
+}
+
+/* ── Trip card HTML ────────────────────────────────────────── */
+function _tripCardHTML(trip) {
+    const d = new Date(trip.ts);
+    const dateStr = d.toLocaleDateString('en-IN', { month:'short', day:'numeric' });
+    const tagsHTML = (trip.tags||[]).map(t => {
+        const cls = `trip-tag trip-tag-${t}`;
+        const label = t.charAt(0).toUpperCase() + t.slice(1);
+        return `<span class="${cls}">${label}</span>`;
+    }).join('');
+    const emoji = _destEmoji(trip.dest);
+    return `
+<div class="trip-card" role="listitem" tabindex="0" data-dest="${_esc(trip.dest)}" data-lat="" data-lon="">
+    <div class="trip-map-thumb">${emoji}</div>
+    <div class="trip-info">
+        <div class="trip-dest">${_esc(trip.dest)}</div>
+        <div class="trip-meta">${dateStr} • ${trip.distKm} km • ${trip.durMin} min</div>
+        <div class="trip-tags">${tagsHTML}</div>
+    </div>
+    <svg class="trip-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+</div>`;
+}
+
+function _destEmoji(dest) {
+    const d = (dest||'').toLowerCase();
+    if (/airport|terminal|fly/.test(d)) return '✈️';
+    if (/railway|station|metro|bus/.test(d)) return '🚉';
+    if (/hospital|medical|clinic|doctor/.test(d)) return '🏥';
+    if (/beach|lake|park|garden/.test(d)) return '🌊';
+    if (/mall|market|bazaar|shop/.test(d)) return '🛒';
+    if (/hotel|resort|inn/.test(d)) return '🏨';
+    if (/restaurant|food|dhaba|café|coffee/.test(d)) return '🍽️';
+    if (/office|corporate|tech|it park/.test(d)) return '🏢';
+    if (/temple|mandir|mosque|church|gurudwara/.test(d)) return '🛕';
+    return '📍';
+}
+
+function _esc(s) {
+    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+/* ── Render recent trips ────────────────────────────────────── */
+function _renderRecentTrips(filter) {
+    let trips = _loadTrips();
+    if (filter && filter !== 'all') trips = trips.filter(t => (t.tags||[]).includes(filter));
+
+    // Recent (profile page — max 3)
+    const recentList = document.getElementById('recent-trips-list');
+    const emptyEl = document.getElementById('trips-empty');
+    if (recentList) {
+        const recent3 = _loadTrips().slice(0,3);
+        if (recent3.length === 0) {
+            recentList.innerHTML = '<div class="trips-empty" id="trips-empty"><svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="rgba(79,158,255,.3)" stroke-width="1.5"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z"/><circle cx="12" cy="10" r="3"/></svg><p>No trips yet. Start navigating!</p></div>';
+        } else {
+            recentList.innerHTML = recent3.map(_tripCardHTML).join('');
+            _bindTripClicks(recentList);
+        }
+    }
+
+    // Activity page — all
+    const actList = document.getElementById('activity-list');
+    if (actList) {
+        if (trips.length === 0) {
+            actList.innerHTML = '<div class="trips-empty"><svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="rgba(79,158,255,.3)" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><p>No activity yet.</p></div>';
+        } else {
+            actList.innerHTML = trips.map(_tripCardHTML).join('');
+            _bindTripClicks(actList);
+        }
+    }
+
+    // Recent places (navigate page)
+    _renderRecentPlaces();
+}
+
+function _bindTripClicks(container) {
+    container.querySelectorAll('.trip-card').forEach(card => {
+        card.addEventListener('click', () => {
+            const dest = card.dataset.dest;
+            if (!dest) return;
+            _openPage(null); // close all pages
+            const input = document.getElementById('dest-input');
+            if (input) { input.value = dest; }
+            // Trigger search
+            const form = document.getElementById('search-form');
+            if (form) form.dispatchEvent(new Event('submit', {bubbles:true,cancelable:true}));
+        });
+    });
+}
+
+/* ── Recent places in navigate page ───────────────────────── */
+function _renderRecentPlaces() {
+    const trips = _loadTrips().slice(0,6);
+    const list = document.getElementById('recent-places-list');
+    if (!list) return;
+    if (trips.length === 0) {
+        list.innerHTML = '<div style="padding:10px 0;color:var(--muted);font-size:.78rem">No recent places yet.</div>';
+        return;
+    }
+    const seen = new Set();
+    const uniq = trips.filter(t => {
+        if (seen.has(t.dest)) return false;
+        seen.add(t.dest);
+        return true;
+    }).slice(0,5);
+    list.innerHTML = uniq.map(t => `
+<div class="recent-place-item" role="listitem" tabindex="0" data-dest="${_esc(t.dest)}">
+    <div class="recent-place-icon">${_destEmoji(t.dest)}</div>
+    <div class="recent-place-info">
+        <div class="recent-place-name">${_esc(t.dest)}</div>
+        <div class="recent-place-sub">${t.distKm} km • ${new Date(t.ts).toLocaleDateString('en-IN',{month:'short',day:'numeric'})}</div>
+    </div>
+</div>`).join('');
+
+    list.querySelectorAll('.recent-place-item').forEach(item => {
+        item.addEventListener('click', () => {
+            const dest = item.dataset.dest;
+            _openPage(null);
+            const input = document.getElementById('dest-input');
+            if (input) { input.value = dest; }
+            const form = document.getElementById('search-form');
+            if (form) form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
+        });
+    });
+}
+
+/* ── Page navigation ────────────────────────────────────────── */
+let _currentPage = null;
+
+function _openPage(pageId) {
+    // Close all panels
+    ['profile','activity','navigate'].forEach(id => {
+        const el = document.getElementById(`page-${id}`);
+        if (el) { el.classList.remove('visible'); el.classList.add('hidden'); }
+    });
+    // Close quick-add sheet
+    const qa = document.getElementById('quick-add-sheet');
+    if (qa) { qa.classList.remove('visible'); qa.classList.add('hidden'); }
+
+    _currentPage = pageId;
+
+    if (!pageId || pageId === 'explore') {
+        // Reset bottom nav to explore
+        _setActiveTab('explore');
+        return;
+    }
+
+    if (pageId === 'quick-add') {
+        const sheet = document.getElementById('quick-add-sheet');
+        if (sheet) { sheet.classList.remove('hidden'); requestAnimationFrame(() => sheet.classList.add('visible')); }
+        return;
+    }
+
+    const panel = document.getElementById(`page-${pageId}`);
+    if (!panel) return;
+    panel.classList.remove('hidden');
+    requestAnimationFrame(() => panel.classList.add('visible'));
+
+    // Refresh data when opening
+    if (pageId === 'profile' || pageId === 'activity') {
+        _renderProfileStats();
+        _renderRecentTrips();
+    }
+    if (pageId === 'navigate') {
+        _renderRecentPlaces();
+        setTimeout(() => {
+            const inp = document.getElementById('nav-page-dest');
+            if (inp) inp.focus();
+        }, 350);
+    }
+}
+
+function _setActiveTab(tab) {
+    document.querySelectorAll('.bnav-item').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.page === tab);
+    });
+}
+
+/* ── Bottom nav wiring ─────────────────────────────────────── */
+function _initBottomNav() {
+    document.querySelectorAll('.bnav-item').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const page = btn.dataset.page;
+            _setActiveTab(page === 'explore' ? 'explore' : page);
+            _openPage(page);
+        });
+    });
+
+    // Back / close buttons
+    document.querySelectorAll('[data-page-close]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            _openPage(null);
+            _setActiveTab('explore');
+        });
+    });
+
+    // Quick-add backdrop
+    const qaBackdrop = document.getElementById('qa-backdrop');
+    if (qaBackdrop) qaBackdrop.addEventListener('click', () => {
+        _openPage(null); _setActiveTab('explore');
+    });
+
+    // Clear history button
+    const clearHistBtn = document.getElementById('clear-history-btn');
+    if (clearHistBtn) clearHistBtn.addEventListener('click', () => {
+        if (confirm('Clear all trip history?')) {
+            _saveTrips([]);
+            _renderProfileStats();
+            _renderRecentTrips();
+        }
+    });
+
+    // View all trips → open activity
+    const viewAll = document.getElementById('view-all-trips-btn');
+    if (viewAll) viewAll.addEventListener('click', () => { _openPage('activity'); _setActiveTab('activity'); });
+
+    // Activity filter tabs
+    document.querySelectorAll('.act-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            document.querySelectorAll('.act-tab').forEach(t => t.classList.remove('active'));
+            tab.classList.add('active');
+            _renderRecentTrips(tab.dataset.filter);
+        });
+    });
+
+    // Profile vehicle selector
+    document.querySelectorAll('.pv-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+            document.querySelectorAll('.pv-chip').forEach(c => c.classList.remove('active'));
+            chip.classList.add('active');
+            const v = chip.dataset.vehicle;
+            const prefs = _loadPrefs();
+            prefs.vehicle = v;
+            _savePrefs(prefs);
+            // Sync with 3D vehicle chips
+            document.querySelectorAll('.vehicle-chip').forEach(c => {
+                c.classList.toggle('active', c.dataset.vehicle === v);
+                c.setAttribute('aria-pressed', String(c.dataset.vehicle === v));
+            });
+            if (typeof _3DM !== 'undefined') _3DM.vehicle = v;
+        });
+    });
+
+    // Navigate page search
+    const navPageDest = document.getElementById('nav-page-dest');
+    const navPageGo   = document.getElementById('nav-page-go-btn');
+    const navPageSugg = document.getElementById('nav-page-suggestions');
+
+    if (navPageDest) {
+        let _npTimer = null;
+        navPageDest.addEventListener('input', () => {
+            const q = navPageDest.value.trim();
+            if (!q || q.length < 2) { if (navPageSugg) navPageSugg.classList.add('hidden'); return; }
+            clearTimeout(_npTimer);
+            _npTimer = setTimeout(() => _fetchNavPageSuggestions(q), 280);
+        });
+        navPageDest.addEventListener('keydown', e => {
+            if (e.key === 'Enter') { e.preventDefault(); _doNavPageSearch(); }
+        });
+    }
+
+    if (navPageGo) navPageGo.addEventListener('click', _doNavPageSearch);
+
+    // India quick destinations
+    document.querySelectorAll('.india-place-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+            const dest = chip.dataset.dest;
+            if (!dest) return;
+            _openPage(null); _setActiveTab('explore');
+            const input = document.getElementById('dest-input');
+            if (input) { input.value = dest; }
+            const form = document.getElementById('search-form');
+            if (form) form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
+        });
+    });
+
+    // Search chips on main search bar
+    document.querySelectorAll('.search-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+            const q = chip.dataset.query;
+            if (!q) return;
+            const input = document.getElementById('dest-input');
+            if (input) { input.value = q; }
+            const form = document.getElementById('search-form');
+            if (form) form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
+        });
+    });
+
+    // Quick actions
+    document.querySelectorAll('.qa-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const action = btn.dataset.action;
+            _openPage(null); _setActiveTab('explore');
+            let q = '';
+            if (action === 'fuel')     q = 'petrol station near me';
+            if (action === 'food')     q = 'restaurant near me';
+            if (action === 'atm')      q = 'ATM near me';
+            if (action === 'hospital') q = 'hospital near me';
+            if (action === 'navigate-home') q = _loadPrefs().home || '';
+            if (action === 'navigate-work') q = _loadPrefs().work || '';
+            if (action === 'share') { _shareLocation(); return; }
+            if (action === 'report') { _showInfo?.('Thank you for your report!', 3000); return; }
+            if (q) {
+                const input = document.getElementById('dest-input');
+                if (input) { input.value = q; }
+                const form = document.getElementById('search-form');
+                if (form) form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
+            }
+        });
+    });
+
+    // Profile settings (placeholder)
+    const settingsBtn = document.getElementById('profile-settings-btn');
+    if (settingsBtn) settingsBtn.addEventListener('click', () => {
+        if (typeof showInfo === 'function') showInfo('Settings coming soon!', 2500);
+    });
+}
+
+/* ── Navigate page suggestions ──────────────────────────────── */
+async function _fetchNavPageSuggestions(q) {
+    const navPageSugg = document.getElementById('nav-page-suggestions');
+    if (!navPageSugg) return;
+    try {
+        const params = new URLSearchParams({q});
+        if (typeof userLat !== 'undefined' && userLat) { params.set('lat', userLat); params.set('lon', userLon); }
+        const res = await fetch(`/suggestions?${params}`);
+        const data = await res.json();
+        if (!data?.length) { navPageSugg.classList.add('hidden'); return; }
+        navPageSugg.innerHTML = data.slice(0,6).map((item,i) => `
+<li class="suggest-item" role="option" id="npsugg-${i}" aria-selected="false">
+    <span class="sug-icon">📍</span>
+    <div class="sug-text">
+        <span class="sug-main">${_esc(item.label)}</span>
+        ${item.sublabel ? `<span class="sug-sub">${_esc(item.sublabel)}</span>` : ''}
+    </div>
+</li>`).join('');
+        navPageSugg.classList.remove('hidden');
+
+        navPageSugg.querySelectorAll('.suggest-item').forEach((li, i) => {
+            li.addEventListener('click', () => {
+                const item = data[i];
+                const inp = document.getElementById('nav-page-dest');
+                if (inp) inp.value = item.label || item.query || '';
+                navPageSugg.classList.add('hidden');
+                _doNavPageSearch();
+            });
+        });
+    } catch(_) { navPageSugg.classList.add('hidden'); }
+}
+
+function _doNavPageSearch() {
+    const inp = document.getElementById('nav-page-dest');
+    if (!inp?.value?.trim()) return;
+    const val = inp.value.trim();
+    _openPage(null); _setActiveTab('explore');
+    const destInput = document.getElementById('dest-input');
+    if (destInput) { destInput.value = val; }
+    const form = document.getElementById('search-form');
+    if (form) form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
+}
+
+/* ── Share location ─────────────────────────────────────────── */
+function _shareLocation() {
+    if (typeof userLat === 'undefined' || !userLat) {
+        if (typeof showError === 'function') showError('GPS not available yet.', 3000);
+        return;
+    }
+    const url = `https://maps.google.com/maps?q=${userLat},${userLon}`;
+    if (navigator.share) {
+        navigator.share({ title:'My Location', url }).catch(()=>{});
+    } else {
+        navigator.clipboard?.writeText(url);
+        if (typeof showInfo === 'function') showInfo('Location link copied!', 2500);
+    }
+}
+
+/* ── Intercept route navigation start (record trip) ─────────── */
+function _hookTripRecording() {
+    // Patch startNavigation to also record the trip
+    if (typeof startNavigation !== 'function') return;
+    const _orig = startNavigation;
+    // We override via the button click instead since startNavigation is const
+    // Use event delegation on nav buttons
+    document.addEventListener('click', e => {
+        const btn = e.target.closest('.card-nav-btn, #start-nav-cta-btn');
+        if (!btn) return;
+        // Get route info from route panel
+        setTimeout(() => {
+            const destText = document.getElementById('dest-input')?.value?.trim() || 'Destination';
+            const distEl = document.getElementById('nav-hud-dist');
+            const timeEl = document.getElementById('nav-hud-time');
+            // Parse distance
+            let distKm = 0, durMin = 0;
+            if (distEl) {
+                const m = distEl.textContent.match(/([\d.]+)/);
+                if (m) { distKm = parseFloat(m[1]); if (distEl.textContent.includes('m') && !distEl.textContent.includes('km')) distKm /= 1000; }
+            }
+            // Use route card data if available
+            const bestCard = document.querySelector('.route-card.is-best');
+            if (bestCard) {
+                const distVal = bestCard.querySelector('[data-dist]')?.dataset.dist;
+                const durVal  = bestCard.querySelector('[data-dur]')?.dataset.dur;
+                if (distVal) distKm = parseFloat(distVal) || distKm;
+                if (durVal)  durMin = parseFloat(durVal) || durMin;
+            }
+            _recordTrip(destText, distKm, durMin, '');
+        }, 1500);
+    }, {passive: true});
+}
+
+/* ── Upgrade route panel UI ──────────────────────────────────── */
+function _upgradeRoutePanelUI() {
+    // Hook into renderRouteCars (the existing function) by observing cards-wrap
+    const cardsWrap = document.getElementById('cards-wrap');
+    if (!cardsWrap) return;
+
+    const obs = new MutationObserver(() => {
+        _enhanceRouteCards();
+        _showRoutePanelExtras();
+    });
+    obs.observe(cardsWrap, { childList: true });
+}
+
+function _showRoutePanelExtras() {
+    const destBanner = document.getElementById('route-dest-banner');
+    const destText   = document.getElementById('route-dest-text');
+    const startCta   = document.getElementById('route-start-cta');
+    const destInput  = document.getElementById('dest-input');
+
+    if (destBanner && destText && destInput?.value) {
+        destText.textContent = destInput.value;
+        destBanner.classList.add('show');
+    }
+    if (startCta) startCta.classList.add('show');
+}
+
+function _enhanceRouteCards() {
+    const cards = document.querySelectorAll('.route-card');
+    cards.forEach((card, idx) => {
+        if (card.dataset.enhanced) return;
+        card.dataset.enhanced = '1';
+
+        // Mark best card
+        if (idx === 0) card.classList.add('is-best');
+
+        // Extract existing data
+        const distEl  = card.querySelector('.stat-val');
+        const durEl   = card.querySelector('.card-stats .stat:nth-child(2) .stat-val');
+        let distKm = 0, durMin = 0;
+
+        // Try to read from existing card markup
+        const allStats = card.querySelectorAll('.stat-val');
+        allStats.forEach(el => {
+            const txt = el.textContent.trim();
+            const unit = el.querySelector('.stat-unit')?.textContent?.trim();
+            const num = parseFloat(txt);
+            if (isNaN(num)) return;
+            if (unit === ' km' || unit === 'km') distKm = num;
+            if (unit === ' min' || unit === 'min') durMin = num;
+        });
+
+        // Store for later
+        const navBtn = card.querySelector('.card-nav-btn');
+        if (navBtn) {
+            navBtn.dataset.dist = distKm;
+            navBtn.dataset.dur  = durMin;
+        }
+
+        // Inject AI badge on best route
+        if (idx === 0 && !card.querySelector('.ai-badge')) {
+            const badge = document.createElement('div');
+            badge.className = 'ai-badge';
+            badge.textContent = 'AI RECOMMENDED';
+            card.insertBefore(badge, card.firstChild);
+        }
+
+        // Inject big time display if not present
+        if (!card.querySelector('.card-big-time') && durMin > 0) {
+            const bigTime = document.createElement('div');
+            bigTime.className = 'card-big-time';
+            const h = Math.floor(durMin / 60), m = Math.round(durMin % 60);
+            bigTime.innerHTML = `<span class="card-big-time-val">${h > 0 ? h+'h ' : ''}${m}</span><span class="card-big-time-unit">min</span>`;
+            // Insert after badge or at start
+            const badge = card.querySelector('.ai-badge');
+            const afterEl = badge || card.querySelector('.card-top');
+            if (afterEl) { card.insertBefore(bigTime, afterEl.nextSibling); }
+            else { card.prepend(bigTime); }
+        }
+
+        // Inject route meta line
+        if (!card.querySelector('.card-route-meta') && distKm > 0) {
+            const meta = document.createElement('div');
+            meta.className = 'card-route-meta';
+            const now = new Date();
+            const eta = new Date(now.getTime() + durMin*60000);
+            const etaStr = eta.toLocaleTimeString('en-IN', {hour:'2-digit', minute:'2-digit'});
+            meta.textContent = `${distKm} km • ${etaStr} arrival`;
+            const bigTime = card.querySelector('.card-big-time');
+            if (bigTime) { bigTime.insertAdjacentElement('afterend', meta); }
+        }
+
+        // Inject AI insight on best route
+        if (idx === 0 && !card.querySelector('.ai-insight-box')) {
+            const insight = document.createElement('div');
+            insight.className = 'ai-insight-box';
+            const insights = [
+                'Optimised for fuel efficiency and fewer traffic signals.',
+                'This route avoids known congestion zones in your city.',
+                'Fastest path via national highway with low signal density.',
+                'Smart route: balances speed, distance, and road quality.',
+                'AI detected less traffic on this corridor right now.',
+            ];
+            const msg = insights[Math.floor(Math.random() * insights.length)];
+            insight.innerHTML = `<span class="ai-insight-icon">🔄</span><div class="ai-insight-text"><span class="ai-insight-label">Why this route?</span>${msg}</div>`;
+            const meta = card.querySelector('.card-route-meta');
+            if (meta) { meta.insertAdjacentElement('afterend', insight); }
+            else { card.appendChild(insight); }
+        }
+
+        // Add alt-route badge for non-best routes
+        if (idx > 0 && !card.querySelector('.card-alt-row')) {
+            const altRow = document.createElement('div');
+            altRow.className = 'card-alt-row';
+            const badges = [
+                { cls:'badge-traffic', text:'+Traffic delay' },
+                { cls:'badge-shortest', text:'Shortest distance' },
+                { cls:'badge-eco', text:'Eco friendly' },
+            ];
+            const b = badges[Math.min(idx-1, badges.length-1)];
+            altRow.innerHTML = `<span></span><span class="card-alt-badge ${b.cls}">${b.text}</span>`;
+            card.appendChild(altRow);
+        }
+    });
+}
+
+/* ── Start nav CTA button ────────────────────────────────────── */
+function _initStartNavCTA() {
+    const btn = document.getElementById('start-nav-cta-btn');
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+        // Start navigation on first (best) route
+        const firstNavBtn = document.querySelector('.card-nav-btn');
+        if (firstNavBtn) { firstNavBtn.click(); }
+    });
+}
+
+/* ── Profile name from prefs ─────────────────────────────────── */
+function _initProfile() {
+    const prefs = _loadPrefs();
+    const nameEl = document.getElementById('profile-name');
+    const subEl  = document.getElementById('profile-sub');
+    if (nameEl && prefs.name) nameEl.textContent = prefs.name;
+    if (subEl) {
+        const year = new Date().getFullYear();
+        subEl.textContent = `Premium Member · ${prefs.city || 'India'}`;
+    }
+    // Restore saved vehicle
+    if (prefs.vehicle) {
+        document.querySelectorAll('.pv-chip').forEach(c => c.classList.toggle('active', c.dataset.vehicle === prefs.vehicle));
+        document.querySelectorAll('.vehicle-chip').forEach(c => c.classList.toggle('active', c.dataset.vehicle === prefs.vehicle));
+        if (typeof _3DM !== 'undefined') _3DM.vehicle = prefs.vehicle;
+    }
+}
+
+/* ── Init ────────────────────────────────────────────────────── */
+function _init() {
+    _initBottomNav();
+    _initProfile();
+    _renderProfileStats();
+    _renderRecentTrips();
+    _upgradeRoutePanelUI();
+    _hookTripRecording();
+    _initStartNavCTA();
+
+    // Demo trip data for first install
+    if (_loadTrips().length === 0) {
+        _recordTrip('Connaught Place, New Delhi', 8.2, 24, 'Best Route');
+        _recordTrip('Cyber City, Gurugram', 15.4, 38, 'Fastest');
+        _recordTrip('Indira Gandhi International Airport', 22.1, 52, 'Best Route');
+    }
+}
+
+// Wait for DOM + existing scripts to load
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _init);
+} else {
+    setTimeout(_init, 100);
+}
+
+})(); // end SmartNavUI IIFE

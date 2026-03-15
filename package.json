@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "[![Live Demo](https://img.shields.io/badge/Demo-Live%20on%20Render-brightgreen?style=for-the-badge)](https://smartnav-ai.onrender.com) [![GitHub](https://img.shields.io/badge/GitHub-Repo-blue?style=for-the-badge&logo=github)](https://github.com/Abhijit9999908/smartnav-ai)",
   "scripts": {
-    "check": "node --check static/script.js && python3 -m py_compile app.py routing_engine.py scoring_engine.py trust_ca.py tunnel.py",
+    "check": "node --check static/script.js && node -e \"const{execSync:e}=require('child_process');try{e('python3 -m py_compile app.py routing_engine.py scoring_engine.py trust_ca.py tunnel.py',{stdio:'inherit'})}catch{e('python -m py_compile app.py routing_engine.py scoring_engine.py trust_ca.py tunnel.py',{stdio:'inherit'})}\"",
     "test": "npm run check"
   },
   "repository": {
@@ -19,8 +19,8 @@
   },
   "homepage": "https://github.com/Abhijit9999908/smartnav-ai#readme",
   "dependencies": {
-    "@capacitor/android": "^8.1.0",
-    "@capacitor/cli": "^8.1.0",
-    "@capacitor/core": "^8.1.0"
+    "@capacitor/android": "^7.2.0",
+    "@capacitor/cli": "^7.2.0",
+    "@capacitor/core": "^7.2.0"
   }
 }

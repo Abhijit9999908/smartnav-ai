@@ -11,9 +11,44 @@ The public HTTPS URL printed to the console works on any phone/browser
 with full geolocation access — no certificate warnings.
 """
 
-import os, sys, threading, time, subprocess, argparse
+import argparse
+import atexit
+import os
+import signal
+import subprocess
+import sys
+import time
+
+
+# ---------------------------------------------------------------------------
+# Child process tracking — prevents ghost python processes on port 5000
+# ---------------------------------------------------------------------------
+_server_proc = None
+
+
+def _cleanup_server():
+    """Terminate the background Flask server if it is still running."""
+    global _server_proc
+    if _server_proc is not None and _server_proc.poll() is None:
+        print("\n[tunnel.py] Stopping Flask server…")
+        _server_proc.terminate()
+        try:
+            _server_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _server_proc.kill()
+            _server_proc.wait(timeout=3)
+        _server_proc = None
+
+
+def _signal_handler(signum, frame):
+    """Handle SIGINT / SIGTERM by cleaning up and exiting."""
+    _cleanup_server()
+    sys.exit(0)
+
 
 def main():
+    global _server_proc
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--token", help="ngrok authtoken (optional, free at ngrok.com)")
     parser.add_argument("--port",  default=5000, type=int)
@@ -24,17 +59,25 @@ def main():
         from pyngrok import conf
         conf.get_default().auth_token = args.token
 
-    # Start Flask in a background thread
+    # Register cleanup handlers BEFORE starting the server
+    atexit.register(_cleanup_server)
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    # Start Flask as a tracked subprocess (NOT a daemon thread)
     env = os.environ.copy()
     env["PYTHONPATH"] = os.path.dirname(__file__)
-    server = threading.Thread(
-        target=lambda: subprocess.run(
-            [sys.executable, "app.py"], cwd=os.path.dirname(__file__) or ".", env=env
-        ),
-        daemon=True,
+    _server_proc = subprocess.Popen(
+        [sys.executable, "app.py"],
+        cwd=os.path.dirname(__file__) or ".",
+        env=env,
     )
-    server.start()
     time.sleep(3)  # wait for Flask to boot
+
+    # Check it actually started
+    if _server_proc.poll() is not None:
+        print("[tunnel.py] Flask server exited unexpectedly.")
+        sys.exit(1)
 
     # Open ngrok tunnel
     try:
@@ -49,9 +92,8 @@ def main():
         print("  Press Ctrl+C to stop.\n")
         print("="*60 + "\n")
 
-        # Keep alive
-        while True:
-            time.sleep(1)
+        # Keep alive — wait for the server process instead of sleeping
+        _server_proc.wait()
 
     except Exception as e:
         print(f"\n[tunnel.py] Could not start ngrok tunnel: {e}")
@@ -60,12 +102,14 @@ def main():
         print(f"  Server is running at: https://{_local_ip()}:{args.port}")
         print("  Trust the cert in Chrome: Advanced → Proceed to site\n")
 
-        # Keep server alive
+        # Keep alive — wait for the server process
         try:
-            while True:
-                time.sleep(1)
+            _server_proc.wait()
         except KeyboardInterrupt:
             pass
+
+    finally:
+        _cleanup_server()
 
 
 def _local_ip():
@@ -81,7 +125,4 @@ def _local_ip():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nShutting down…")
+    main()
