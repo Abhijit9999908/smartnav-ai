@@ -1041,13 +1041,20 @@ function _startWatchingGPS(forceRestart = false) {
     _kfLat.reset();
     _kfLon.reset();
 
+    // Respect GPS mode preference for battery vs accuracy
+    const _gpsPrefs = (function(){ try { return JSON.parse(localStorage.getItem('smartnav.prefs'))||{}; } catch(_){ return {}; } })();
+    const _gpsMode = _gpsPrefs.gpsMode || 'balanced';
+    const _initialHA = _gpsMode === 'high';             // only high-accuracy on initial fix if user chose 'high'
+    const _watchHA   = _gpsMode !== 'low';               // watch uses high-accuracy unless 'low' (Power Saver)
+    const _watchTimeout = _gpsMode === 'low' ? 30000 : 15000;
+
     navigator.geolocation.getCurrentPosition(onGPSFix, onGPSError, {
-        enableHighAccuracy: false, timeout: 8000, maximumAge: 10000,
+        enableHighAccuracy: _initialHA, timeout: 8000, maximumAge: 10000,
     });
 
     _gpsWatchId = navigator.geolocation.watchPosition(onGPSFix, onGPSError, {
-        enableHighAccuracy: true,
-        timeout: 15000,
+        enableHighAccuracy: _watchHA,
+        timeout: _watchTimeout,
         maximumAge: 0,
     });
 }
@@ -1071,10 +1078,19 @@ function onGPSFix(pos) {
         return;
     }
 
-    _kfLat.setAccuracy(Math.min(acc, 300));
-    _kfLon.setAccuracy(Math.min(acc, 300));
-    const lat = _kfLat.update(rawLat);
-    const lon = _kfLon.update(rawLon);
+    // Respect Kalman smoothing toggle from user settings
+    const _kPrefs = (function(){ try { return JSON.parse(localStorage.getItem('smartnav.prefs'))||{}; } catch(_){ return {}; } })();
+    const _useKalman = _kPrefs.kalmanSmoothing !== false;
+    let lat, lon;
+    if (_useKalman) {
+        _kfLat.setAccuracy(Math.min(acc, 300));
+        _kfLon.setAccuracy(Math.min(acc, 300));
+        lat = _kfLat.update(rawLat);
+        lon = _kfLon.update(rawLon);
+    } else {
+        lat = rawLat;
+        lon = rawLon;
+    }
 
     const gpsSpeed = pos.coords.speed;
     const gpsHeading = pos.coords.heading;
@@ -1091,9 +1107,12 @@ function onGPSFix(pos) {
     }
     speedKmh = Math.min(speedKmh, 200);
 
+    // 8-sample weighted average for smoother, more responsive speed
     _navSpeedHistory.push(speedKmh);
-    if (_navSpeedHistory.length > 5) _navSpeedHistory.shift();
-    userSpeedKmh = _navSpeedHistory.reduce((a, b) => a + b, 0) / _navSpeedHistory.length;
+    if (_navSpeedHistory.length > 8) _navSpeedHistory.shift();
+    const _wTotal = _navSpeedHistory.reduce((s, v, i) => s + v * (i + 1), 0);
+    const _wDiv   = _navSpeedHistory.reduce((s, _, i) => s + (i + 1), 0);
+    userSpeedKmh = _wDiv > 0 ? _wTotal / _wDiv : 0;
 
     let rawBearing = null;
     if (gpsHeading !== null && gpsHeading !== undefined && isFinite(gpsHeading) && !isNaN(gpsHeading) && speedKmh > 0.5) {
@@ -3176,749 +3195,692 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
    • Speed-colour badge (green/yellow/orange/red)
 ================================================================ */
 
-/* ── India bounding box ───────────────────────────────────── */
+/* ================================================================
+   3D MAP ENGINE — MapLibre GL  v4.0  (SmartNav India)
+   Real GPS. India-bounded. 5-layer buildings. Animated routes.
+   Speed-reactive zoom. Device-orientation heading. Fog/sky.
+================================================================ */
+
 const INDIA_BOUNDS = [[68.1, 6.5], [97.5, 37.6]];
 const INDIA_CENTER = [78.9629, 20.5937];
 
-/* ── 3D scene state ────────────────────────────────────────── */
 const _3DM = {
-    map: null, active: false, styleReady: false,
-    /* route */
+    map:null, active:false, styleReady:false,
     routeLLs:[], routeCoords:[], totalDist:0, travelledDist:0,
-    /* vehicle */
     vehicle:'car', vehicleMarker:null,
-    /* real GPS */
     curLat:null, curLon:null, curAcc:null,
-    /* smooth render position */
     rndLat:null, rndLon:null,
-    /* heading */
     gpsBearing:0, devBearing:0, tgtBearing:0, camBearing:0,
-    /* camera */
-    camLat:0, camLon:0, pitchMode:63, zoomNav:18.0,
-    /* control */
-    rafId:null, lastTs:null,
-    followMode:true,     // follow GPS position
-    followHeading:true,  // follow GPS/device heading
-    userRotating:false,  // two-finger rotate active
+    camLat:0, camLon:0,
+    pitchMode:63, zoomNav:18.0,
+    followMode:true, followHeading:true, userRotating:false,
     devOrient:false, _devOrFn:null,
-    _routeUpdateTimer:0, // throttle route update to max 4/s
+    _routeTimer:0, _accTimer:0, _dashTs:0,
 };
 
-/* ── Vehicle catalogue ─────────────────────────────────────── */
+/* ── Vehicle catalogue ──────────────────────────────────── */
 const _3DM_V = {
-    car:        { color:'#4f9eff', hi:'#b0d8ff', shadow:'rgba(0,80,200,.35)',  w:46, h:60 },
-    suv:        { color:'#00e676', hi:'#90ffc8', shadow:'rgba(0,160,80,.35)',  w:50, h:64 },
-    motorcycle: { color:'#ff9100', hi:'#ffcc80', shadow:'rgba(200,80,0,.35)',  w:28, h:58 },
-    bus:        { color:'#ffd740', hi:'#fff3a0', shadow:'rgba(180,140,0,.35)', w:58, h:66 },
-    truck:      { color:'#ce93d8', hi:'#ead0f5', shadow:'rgba(120,0,180,.35)', w:52, h:62 },
+    car:        {color:'#4f9eff',hi:'#c0e0ff',accent:'#2870d4',w:56,h:72},
+    suv:        {color:'#00e676',hi:'#9affd4',accent:'#00b35a',w:60,h:76},
+    motorcycle: {color:'#ff9100',hi:'#ffd080',accent:'#e07800',w:36,h:68},
+    bus:        {color:'#ffd740',hi:'#fff5a0',accent:'#d4aa00',w:66,h:78},
+    truck:      {color:'#ce93d8',hi:'#eadaff',accent:'#a060c0',w:62,h:74},
 };
 
-/* ── Lighten hex ───────────────────────────────────────────── */
-function _3dmLight(hex, amt) {
-    const n = parseInt(hex.replace('#',''), 16);
-    return `rgb(${Math.min(255,((n>>16)&255)+amt)},${Math.min(255,((n>>8)&255)+amt)},${Math.min(255,(n&255)+amt)})`;
-}
+function _3dmLight(hex,amt){const n=parseInt(hex.replace('#',''),16);return `rgb(${Math.min(255,((n>>16)&255)+amt)},${Math.min(255,((n>>8)&255)+amt)},${Math.min(255,(n&255)+amt)})`;}
 
-/* ── SVG top-down vehicle marker ───────────────────────────── */
+/* ── Vehicle marker HTML (3D Realistic) ──────────────── */
 function _3dmMarkerHTML(key) {
     const v = _3DM_V[key] || _3DM_V.car;
-    const { color, hi, w, h } = v;
-    const hw = w/2, hh = h/2;
-    const isMoto = key==='motorcycle', isBus=key==='bus', isTruck=key==='truck';
+    const {color,hi,accent,w,h} = v;
+    const hw=w/2, hh=h/2;
+    const isMoto=key==='motorcycle', isBus=key==='bus', isTruck=key==='truck', isSuv=key==='suv';
 
+    /* ---- Body path (top-down silhouette) ---- */
     const bPath = isMoto
-        ? `M0,${-hh*.88} L${hw*.55},${hh*.5} Q0,${hh*.78} ${-hw*.55},${hh*.5}Z`
-        : isBus   ? `M${-hw*.82},${-hh*.9} L${hw*.82},${-hh*.9} L${hw*.9},${hh*.9} L${-hw*.9},${hh*.9} Q${-hw*.92},${hh*.7} ${-hw*.82},${hh*.9}Z`
-        : isTruck ? `M0,${-hh*.92} L${hw*.78},${-hh*.35} L${hw*.92},${hh*.9} L${-hw*.92},${hh*.9} L${-hw*.78},${-hh*.35}Z`
-        :           `M0,${-hh*.94} L${hw*.74},${hh*.45} Q${hw*.68},${hh*.82} 0,${hh*.74} Q${-hw*.68},${hh*.82} ${-hw*.74},${hh*.45}Z`;
+        ? `M0,${-hh*.92} Q${hw*.35},${-hh*.88} ${hw*.42},${-hh*.5} L${hw*.3},${hh*.5} Q0,${hh*.82} ${-hw*.3},${hh*.5} L${-hw*.42},${-hh*.5} Q${-hw*.35},${-hh*.88} 0,${-hh*.92}Z`
+        : isBus
+        ? `M${-hw*.88},${-hh*.88} Q${-hw*.92},${-hh*.92} ${-hw*.86},${-hh*.92} L${hw*.86},${-hh*.92} Q${hw*.92},${-hh*.92} ${hw*.88},${-hh*.88} L${hw*.90},${hh*.88} Q${hw*.92},${hh*.92} ${hw*.86},${hh*.92} L${-hw*.86},${hh*.92} Q${-hw*.92},${hh*.92} ${-hw*.90},${hh*.88}Z`
+        : isTruck
+        ? `M${-hw*.78},${-hh*.88} Q0,${-hh*.96} ${hw*.78},${-hh*.88} L${hw*.88},${-hh*.28} L${hw*.92},${hh*.88} Q${hw*.90},${hh*.94} 0,${hh*.86} Q${-hw*.90},${hh*.94} ${-hw*.92},${hh*.88} L${-hw*.88},${-hh*.28}Z`
+        : isSuv
+        ? `M0,${-hh*.96} C${hw*.48},${-hh*.96} ${hw*.82},${-hh*.68} ${hw*.78},${hh*.22} Q${hw*.76},${hh*.72} ${hw*.62},${hh*.82} L0,${hh*.78} L${-hw*.62},${hh*.82} Q${-hw*.76},${hh*.72} ${-hw*.78},${hh*.22} C${-hw*.82},${-hh*.68} ${-hw*.48},${-hh*.96} 0,${-hh*.96}Z`
+        : `M0,${-hh*.96} C${hw*.44},${-hh*.96} ${hw*.78},${-hh*.58} ${hw*.74},${hh*.14} Q${hw*.70},${hh*.68} ${hw*.56},${hh*.80} L0,${hh*.76} L${-hw*.56},${hh*.80} Q${-hw*.70},${hh*.68} ${-hw*.74},${hh*.14} C${-hw*.78},${-hh*.58} ${-hw*.44},${-hh*.96} 0,${-hh*.96}Z`;
 
-    const wPath = isMoto ? `M${-hw*.3},${-hh*.62} Q0,${-hh*.8} ${hw*.3},${-hh*.62} L${hw*.2},${-hh*.3} Q0,${-hh*.5} ${-hw*.2},${-hh*.3}Z`
-        : isBus   ? `M${-hw*.7},${-hh*.74} L${hw*.7},${-hh*.74} L${hw*.7},${-hh*.4} L${-hw*.7},${-hh*.4}Z`
-        :           `M${-hw*.44},${-hh*.72} Q0,${-hh*.86} ${hw*.44},${-hh*.72} L${hw*.32},${-hh*.44} Q0,${-hh*.62} ${-hw*.32},${-hh*.44}Z`;
+    /* ---- Windshield ---- */
+    const wPath = isMoto
+        ? `M${-hw*.22},${-hh*.68} Q0,${-hh*.82} ${hw*.22},${-hh*.68} L${hw*.16},${-hh*.38} Q0,${-hh*.52} ${-hw*.16},${-hh*.38}Z`
+        : isBus
+        ? `M${-hw*.72},${-hh*.78} L${hw*.72},${-hh*.78} L${hw*.72},${-hh*.44} L${-hw*.72},${-hh*.44}Z`
+        : isTruck
+        ? `M${-hw*.58},${-hh*.72} Q0,${-hh*.84} ${hw*.58},${-hh*.72} L${hw*.48},${-hh*.32} Q0,${-hh*.48} ${-hw*.48},${-hh*.32}Z`
+        : `M${-hw*.48},${-hh*.74} Q0,${-hh*.90} ${hw*.48},${-hh*.74} L${hw*.36},${-hh*.42} Q0,${-hh*.60} ${-hw*.36},${-hh*.42}Z`;
 
-    const hlL = isMoto ? [-hw*.2,-hh*.78] : [-hw*.54,-hh*.84];
-    const hlR = isMoto ? [ hw*.2,-hh*.78] : [ hw*.54,-hh*.84];
-    const roofLine = isMoto ? `` :
-        `<line x1="0" y1="${-hh*.6}" x2="0" y2="${hh*.58}" stroke="rgba(255,255,255,.20)" stroke-width="${isBus?2.2:1.6}"/>`;
-    const tlY=hh*(isBus?.82:.68), tlW=hw*(isBus?.22:.19), tlH=hh*.11;
+    /* ---- Rear window ---- */
+    const rwPath = isMoto ? '' : isBus ? '' :
+        `<path d="M${-hw*.34},${hh*.36} Q0,${hh*.56} ${hw*.34},${hh*.36} L${hw*.40},${hh*.58} Q0,${hh*.72} ${-hw*.40},${hh*.58}Z" fill="rgba(130,200,255,.35)" stroke="rgba(255,255,255,.12)" stroke-width=".5"/>`;
 
-    // Wheel positions
-    const wlFrX=-hw*.56, wlRrX=-hw*.56, wrFrX=hw*.56, wrRrX=hw*.56;
-    const wFrY=-hh*(isBus?.55:.45), wRrY=hh*(isBus?.65:.62);
-    const wR=isMoto?hw*.18:hw*.14;
-    const wheels = isMoto ? `` : `
-    <ellipse cx="${wlFrX}" cy="${wFrY}" rx="${wR}" ry="${wR*1.05}" fill="rgba(0,0,0,.7)"/>
-    <ellipse cx="${wrFrX}" cy="${wFrY}" rx="${wR}" ry="${wR*1.05}" fill="rgba(0,0,0,.7)"/>
-    <ellipse cx="${wlRrX}" cy="${wRrY}" rx="${wR}" ry="${wR*1.05}" fill="rgba(0,0,0,.7)"/>
-    <ellipse cx="${wrRrX}" cy="${wRrY}" rx="${wR}" ry="${wR*1.05}" fill="rgba(0,0,0,.7)"/>
-    <ellipse cx="${wlFrX}" cy="${wFrY}" rx="${wR*.55}" ry="${wR*.55}" fill="rgba(70,70,80,.9)"/>
-    <ellipse cx="${wrFrX}" cy="${wFrY}" rx="${wR*.55}" ry="${wR*.55}" fill="rgba(70,70,80,.9)"/>
-    <ellipse cx="${wlRrX}" cy="${wRrY}" rx="${wR*.55}" ry="${wR*.55}" fill="rgba(70,70,80,.9)"/>
-    <ellipse cx="${wrRrX}" cy="${wRrY}" rx="${wR*.55}" ry="${wR*.55}" fill="rgba(70,70,80,.9)"/>`;
+    /* ---- Headlights (warm LED) ---- */
+    const hlY = -hh*.90;
+    const hlW = isMoto ? hw*.16 : hw*.18;
+    const hlH = isMoto ? hh*.04 : hh*.06;
+    const hlX1 = isMoto ? -hw*.18 : -hw*.56;
+    const hlX2 = isMoto ? hw*.18 : hw*.56;
+    const hlGlow = `<ellipse cx="${hlX1}" cy="${hlY}" rx="${hlW*1.8}" ry="${hlH*2.6}" fill="rgba(255,248,220,.10)"/>
+        <ellipse cx="${hlX1}" cy="${hlY}" rx="${hlW}" ry="${hlH}" fill="rgba(255,252,240,.96)"/>
+        <ellipse cx="${hlX2}" cy="${hlY}" rx="${hlW*1.8}" ry="${hlH*2.6}" fill="rgba(255,248,220,.10)"/>
+        <ellipse cx="${hlX2}" cy="${hlY}" rx="${hlW}" ry="${hlH}" fill="rgba(255,252,240,.96)"/>`;
+    // Centre DRL for car/suv
+    const drl = (!isMoto && !isBus && !isTruck) ? `<rect x="${-hw*.14}" y="${hlY-hh*.01}" width="${hw*.28}" height="${hh*.025}" rx="1.5" fill="rgba(255,255,255,.6)"/>` : '';
 
+    /* ---- Taillights ---- */
+    const tlY = isBus ? hh*.88 : hh*.72;
+    const tlW = hw*.22, tlH = hh*.08;
+    const tlGlow = `<rect x="${-hw*.82}" y="${tlY}" width="${tlW}" height="${tlH}" rx="3" fill="rgba(255,30,30,.95)"/>
+        <rect x="${-hw*.86}" y="${tlY-hh*.01}" width="${tlW*1.4}" height="${tlH*1.6}" rx="4" fill="rgba(255,30,30,.10)"/>
+        <rect x="${hw*.60}" y="${tlY}" width="${tlW}" height="${tlH}" rx="3" fill="rgba(255,30,30,.95)"/>
+        <rect x="${hw*.56}" y="${tlY-hh*.01}" width="${tlW*1.4}" height="${tlH*1.6}" rx="4" fill="rgba(255,30,30,.10)"/>`;
+
+    /* ---- Wheels / tyres ---- */
+    const wR = isMoto ? hw*.24 : hw*.16;
+    const wFrY = isMoto ? -hh*.46 : -hh*.52;
+    const wRrY = isMoto ? hh*.55 : hh*.60;
+    const wxL = isMoto ? 0 : -hw*.62;
+    const wxR = isMoto ? 0 : hw*.62;
+    const wheelSvg = (cx,cy) => `<ellipse cx="${cx}" cy="${cy}" rx="${wR*1.1}" ry="${wR*1.2}" fill="#080c16"/>
+        <ellipse cx="${cx}" cy="${cy}" rx="${wR*.68}" ry="${wR*.72}" fill="#18202e"/>
+        <ellipse cx="${cx}" cy="${cy}" rx="${wR*.32}" ry="${wR*.34}" fill="rgba(90,100,120,.7)"/>`;
+    const wheelsAll = isMoto
+        ? wheelSvg(0,wFrY) + wheelSvg(0,wRrY)
+        : [wxL,wxR].flatMap(cx => [wheelSvg(cx,wFrY), wheelSvg(cx,wRrY)]).join('');
+
+    /* ---- Door/panel lines ---- */
+    const doorLines = isMoto ? '' : isBus
+        ? `<line x1="0" y1="${-hh*.38}" x2="0" y2="${hh*.82}" stroke="rgba(255,255,255,.08)" stroke-width=".8"/>
+           <line x1="${-hw*.44}" y1="${-hh*.38}" x2="${-hw*.44}" y2="${hh*.82}" stroke="rgba(255,255,255,.06)" stroke-width=".6"/>
+           <line x1="${hw*.44}" y1="${-hh*.38}" x2="${hw*.44}" y2="${hh*.82}" stroke="rgba(255,255,255,.06)" stroke-width=".6"/>`
+        : `<line x1="${-hw*.04}" y1="${-hh*.38}" x2="${-hw*.04}" y2="${hh*.60}" stroke="rgba(255,255,255,.10)" stroke-width=".7"/>
+           <line x1="${hw*.04}" y1="${-hh*.38}" x2="${hw*.04}" y2="${hh*.60}" stroke="rgba(255,255,255,.10)" stroke-width=".7"/>`;
+
+    /* ---- Side windows (car/suv only) ---- */
+    const sideWins = (key==='car'||isSuv)
+        ? `<rect x="${-hw*.68}" y="${-hh*.24}" width="${hw*.26}" height="${hh*.30}" rx="3" fill="rgba(130,210,255,.32)" stroke="rgba(255,255,255,.08)" stroke-width=".5"/>
+           <rect x="${hw*.42}" y="${-hh*.24}" width="${hw*.26}" height="${hh*.30}" rx="3" fill="rgba(130,210,255,.32)" stroke="rgba(255,255,255,.08)" stroke-width=".5"/>`
+        : '';
+
+    /* ---- Bus windows ---- */
+    const busWins = isBus
+        ? [0,1,2,3,4].map(i => `<rect x="${-hw*.72+i*hw*.30}" y="${-hh*.30}" width="${hw*.22}" height="${hh*.28}" rx="2.5" fill="rgba(130,210,255,.30)" stroke="rgba(255,255,255,.08)" stroke-width=".4"/>`).join('')
+        : '';
+
+    /* ---- Motorcycle-specific: handlebars + seat ---- */
+    const motoDetails = isMoto
+        ? `<line x1="${-hw*.52}" y1="${-hh*.48}" x2="${hw*.52}" y2="${-hh*.48}" stroke="rgba(200,210,220,.85)" stroke-width="2" stroke-linecap="round"/>
+           <ellipse cx="0" cy="${hh*.08}" rx="${hw*.24}" ry="${hh*.12}" fill="rgba(40,30,20,.8)" stroke="rgba(80,60,40,.4)" stroke-width=".8"/>
+           <ellipse cx="0" cy="${-hh*.15}" rx="${hw*.18}" ry="${hh*.06}" fill="rgba(${parseInt(color.slice(1,3),16)},${parseInt(color.slice(3,5),16)},${parseInt(color.slice(5,7),16)},.55)"/>`
+        : '';
+
+    /* ---- Truck-specific: cargo box outline ---- */
+    const truckCargo = isTruck
+        ? `<rect x="${-hw*.82}" y="${-hh*.18}" width="${hw*1.64}" height="${hh*1.0}" rx="4" fill="none" stroke="rgba(255,255,255,.10)" stroke-width="1.2"/>
+           <line x1="${-hw*.82}" y1="${hh*.22}" x2="${hw*.82}" y2="${hh*.22}" stroke="rgba(255,255,255,.06)" stroke-width=".7"/>`
+        : '';
+
+    /* ---- Roof highlight strip ---- */
+    const roofLine = isMoto ? '' : `<line x1="0" y1="${-hh*.62}" x2="0" y2="${hh*.5}" stroke="rgba(255,255,255,.14)" stroke-width="${isBus?2.2:1.2}"/>`;
+
+    /* ---- Edge outline ---- */
+    const bodyOutline = `<path d="${bPath}" fill="none" stroke="rgba(255,255,255,.18)" stroke-width=".9"/>`;
+
+    /* ---- Ground shadow ellipse ---- */
+    const groundShadow = `<ellipse cx="2" cy="${hh*.82}" rx="${hw*.68}" ry="${hh*.12}" fill="rgba(0,0,0,.55)"/>`;
+
+    /* ---- Assemble full SVG ---- */
     return `<div style="width:${w}px;height:${h}px;position:relative;pointer-events:none;transform-origin:${hw}px ${hh}px">
-  <div style="position:absolute;inset:-${Math.round(w*.52)}px;background:radial-gradient(circle,${color}3a 0%,transparent 62%);border-radius:50%;animation:_3dmPulse 2.4s ease-in-out infinite;pointer-events:none;will-change:transform,opacity"></div>
+  <div style="position:absolute;inset:-${Math.round(w*.6)}px;background:radial-gradient(circle,${color}30 0%,transparent 55%);border-radius:50%;animation:_3dmPulse 2.6s ease-in-out infinite;pointer-events:none;will-change:opacity,transform"></div>
   <svg width="${w}" height="${h}" viewBox="${-hw} ${-hh} ${w} ${h}" xmlns="http://www.w3.org/2000/svg" style="overflow:visible;display:block">
     <defs>
-      <linearGradient id="_vg${key}" x1="0%" y1="0%" x2="0%" y2="100%">
+      <linearGradient id="_vg3d${key}" x1="0%" y1="0%" x2="0%" y2="100%">
         <stop offset="0%" stop-color="${hi}"/>
+        <stop offset="18%" stop-color="${_3dmLight(color,40)}"/>
         <stop offset="50%" stop-color="${color}"/>
-        <stop offset="100%" stop-color="${color}99"/>
+        <stop offset="82%" stop-color="${accent}"/>
+        <stop offset="100%" stop-color="${color}66"/>
       </linearGradient>
-      <linearGradient id="_vs${key}" x1="0%" y1="0%" x2="100%" y2="0%">
+      <linearGradient id="_vsg3d${key}" x1="0%" y1="0%" x2="100%" y2="0%">
+        <stop offset="0%" stop-color="rgba(255,255,255,.04)"/>
+        <stop offset="35%" stop-color="rgba(255,255,255,.30)"/>
+        <stop offset="50%" stop-color="rgba(255,255,255,.42)"/>
+        <stop offset="65%" stop-color="rgba(255,255,255,.25)"/>
+        <stop offset="100%" stop-color="rgba(255,255,255,.02)"/>
+      </linearGradient>
+      <radialGradient id="_vrg3d${key}" cx="40%" cy="30%" r="60%">
         <stop offset="0%" stop-color="rgba(255,255,255,.22)"/>
-        <stop offset="50%" stop-color="rgba(255,255,255,.38)"/>
-        <stop offset="100%" stop-color="rgba(255,255,255,.10)"/>
-      </linearGradient>
-      <filter id="_vf${key}" x="-70%" y="-70%" width="240%" height="240%">
-        <feGaussianBlur in="SourceAlpha" stdDeviation="4" result="blur"/>
-        <feFlood flood-color="${color}" flood-opacity=".6" result="clr"/>
-        <feComposite in="clr" in2="blur" operator="in" result="glow"/>
-        <feMerge><feMergeNode in="glow"/><feMergeNode in="SourceGraphic"/></feMerge>
+        <stop offset="100%" stop-color="rgba(255,255,255,0)"/>
+      </radialGradient>
+      <filter id="_vf3d${key}" x="-80%" y="-80%" width="260%" height="260%">
+        <feGaussianBlur in="SourceAlpha" stdDeviation="5" result="b"/>
+        <feFlood flood-color="${color}" flood-opacity=".6" result="c"/>
+        <feComposite in="c" in2="b" operator="in" result="g"/>
+        <feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>
+      <filter id="_glass3d${key}" x="-20%" y="-20%" width="140%" height="140%">
+        <feGaussianBlur in="SourceGraphic" stdDeviation="0.6"/>
       </filter>
     </defs>
-    <!-- Drop shadow -->
-    <ellipse cx="2" cy="${hh*.72}" rx="${hw*.6}" ry="${hh*.09}" fill="rgba(0,0,0,.5)"/>
-    <!-- Wheels (rendered before body) -->
-    ${wheels}
-    <!-- Body -->
-    <path d="${bPath}" fill="url(#_vg${key})" filter="url(#_vf${key})"/>
-    <!-- Side highlight -->
-    <path d="${bPath}" fill="url(#_vs${key})" opacity=".38"/>
-    <!-- Windshield -->
-    <path d="${wPath}" fill="rgba(160,225,255,.58)" stroke="rgba(255,255,255,.22)" stroke-width=".8"/>
-    <!-- Roof stripe -->
-    ${roofLine}
-    <!-- Headlights -->
-    <ellipse cx="${hlL[0]}" cy="${hlL[1]}" rx="${hw*.13}" ry="${hh*.055}" fill="rgba(255,248,210,.95)"/>
-    <ellipse cx="${hlR[0]}" cy="${hlR[1]}" rx="${hw*.13}" ry="${hh*.055}" fill="rgba(255,248,210,.95)"/>
-    <!-- Headlight bloom -->
-    <ellipse cx="${hlL[0]}" cy="${hlL[1]}" rx="${hw*.22}" ry="${hh*.1}" fill="rgba(255,248,210,.15)"/>
-    <ellipse cx="${hlR[0]}" cy="${hlR[1]}" rx="${hw*.22}" ry="${hh*.1}" fill="rgba(255,248,210,.15)"/>
-    <!-- Tail lights -->
-    <rect x="${-hw*.84}" y="${tlY}" width="${tlW}" height="${tlH}" rx="2.5" fill="rgba(255,40,40,.92)"/>
-    <rect x="${hw*.62}" y="${tlY}" width="${tlW}" height="${tlH}" rx="2.5" fill="rgba(255,40,40,.92)"/>
-    <!-- Tail light bloom -->
-    <rect x="${-hw*.84}" y="${tlY}" width="${tlW*1.5}" height="${tlH*1.4}" rx="3" fill="rgba(255,40,40,.14)"/>
-    <rect x="${hw*.55}" y="${tlY}" width="${tlW*1.5}" height="${tlH*1.4}" rx="3" fill="rgba(255,40,40,.14)"/>
-    <!-- Front nose dot -->
-    <ellipse cx="0" cy="${-hh*.9}" rx="${hw*.09}" ry="${hh*.045}" fill="rgba(255,255,255,.92)"/>
-    <!-- Body outline -->
-    <path d="${bPath}" fill="none" stroke="rgba(255,255,255,.18)" stroke-width=".7"/>
+    ${groundShadow}
+    ${wheelsAll}
+    <path d="${bPath}" fill="url(#_vg3d${key})" filter="url(#_vf3d${key})"/>
+    <path d="${bPath}" fill="url(#_vsg3d${key})" opacity=".30"/>
+    <path d="${bPath}" fill="url(#_vrg3d${key})" opacity=".45"/>
+    <path d="${wPath}" fill="rgba(140,215,255,.55)" stroke="rgba(255,255,255,.20)" stroke-width=".9" filter="url(#_glass3d${key})"/>
+    ${rwPath}
+    ${sideWins}${busWins}
+    ${doorLines}${roofLine}
+    ${motoDetails}${truckCargo}
+    ${hlGlow}${drl}
+    ${tlGlow}
+    ${bodyOutline}
   </svg>
 </div>`;
 }
 
-/* ── Deep India night theme v2 ─────────────────────────────── */
+/* ── Night theme v5 — Tesla/Google-level ───────────────── */
 function _3dmNightTheme(map) {
     const ls = map.getStyle()?.layers || [];
-
-    ls.forEach(({ id, type }) => {
+    ls.forEach(({id,type}) => {
         try {
-            if (type === 'background') {
-                map.setPaintProperty(id, 'background-color', '#030810');
-
-            } else if (type === 'fill') {
-                let c = '#050a14';
-                if (/water|ocean|sea|lake|reservoir|bay/.test(id))          c = '#020a1e';
-                else if (/park|garden|forest|wood|grass|green|nature/.test(id)) c = '#030f06';
-                else if (/building/.test(id))                               c = '#07121e';
-                else if (/sand|beach|bare|scrub|desert/.test(id))           c = '#080a10';
-                else if (/industrial/.test(id))                              c = '#060c18';
-                else if (/commercial|retail/.test(id))                       c = '#060d1c';
-                else if (/residential|suburb|housing/.test(id))             c = '#04091c';
-                else if (/pitch|playground|sport/.test(id))                 c = '#040d08';
-                else if (/cemetery|grave/.test(id))                         c = '#060c10';
-                map.setPaintProperty(id, 'fill-color', c);
-                try { map.setPaintProperty(id, 'fill-outline-color', 'rgba(8,22,50,.28)'); } catch(_) {}
-                try { map.setPaintProperty(id, 'fill-opacity', 1); } catch(_) {}
-
-            } else if (type === 'line') {
-                let c = '#0a1628';
-                // India highway colours — vivid but dark
-                if (/motorway/.test(id))                                     c = '#1e3868';
-                else if (/trunk/.test(id))                                   c = '#183060';
-                else if (/primary/.test(id))                                 c = '#142650';
-                else if (/secondary/.test(id))                               c = '#101e3e';
-                else if (/tertiary/.test(id))                                c = '#0c1830';
-                else if (/residential|living_street/.test(id))               c = '#0a1428';
-                else if (/service|alley/.test(id))                           c = '#081020';
-                else if (/footway|path|steps/.test(id))                      c = '#070d1a';
-                else if (/cycleway|bicycle/.test(id))                        c = '#0a1420';
-                else if (/water|river|canal|stream/.test(id))                c = '#020916';
-                else if (/rail|railway|transit|subway/.test(id))             c = '#0e1b34';
-                else if (/bridge/.test(id))                                  c = '#162040';
-                else if (/boundary|country|state/.test(id))                  c = '#18223a';
-                else if (/building/.test(id))                                c = '#0c1830';
-                map.setPaintProperty(id, 'line-color', c);
-
-            } else if (type === 'symbol') {
-                const isMotorway = /motorway|highway/.test(id);
-                const isPrimary  = /trunk|primary/.test(id);
-                const isCity     = /city|capital|town|village|place/.test(id);
-                const isRoad     = /road|street|secondary|tertiary/.test(id);
-                const isWater    = /water|ocean|sea|lake|river/.test(id);
-                const isPOI      = /poi|shop|amenity|tourism/.test(id);
-                let textColor = '#0e1e38';
-                if (isMotorway) textColor = '#1e3a70';
-                else if (isPrimary) textColor = '#1a3060';
-                else if (isCity)   textColor = '#1e3460';
-                else if (isRoad)   textColor = '#121e3a';
-                else if (isWater)  textColor = '#0a1c3a';
-                try { map.setPaintProperty(id, 'text-color', textColor); } catch(_){}
-                try { map.setPaintProperty(id, 'text-halo-color', '#010509'); } catch(_){}
-                try { map.setPaintProperty(id, 'text-halo-width', isPrimary||isCity ? 1.2 : 0.8); } catch(_){}
-                try { map.setPaintProperty(id, 'icon-opacity', isCity ? 0.45 : isPOI ? 0.18 : 0.12); } catch(_){}
+            if (type==='background') {
+                map.setPaintProperty(id,'background-color','#010308');
+            } else if (type==='fill') {
+                let c='#030810';
+                if (/water|ocean|sea|lake|reservoir|bay|wetland/.test(id))            c='#010514';
+                else if (/park|garden|forest|wood|grass|green|nature|meadow/.test(id)) c='#020a04';
+                else if (/building/.test(id))                                          c='#0a0f18';
+                else if (/sand|beach|desert/.test(id))                                c='#05070c';
+                else if (/industrial/.test(id))                                        c='#040a14';
+                else if (/commercial|retail/.test(id))                                c='#040e1a';
+                else if (/residential|suburb/.test(id))                               c='#030714';
+                else if (/pitch|playground|sport/.test(id))                           c='#020a04';
+                else if (/landuse|farmland|cemetery/.test(id))                        c='#030810';
+                map.setPaintProperty(id,'fill-color',c);
+                try{map.setPaintProperty(id,'fill-outline-color','rgba(4,12,30,.18)');}catch(_){}
+            } else if (type==='line') {
+                let c='#070e18';let w=null;
+                if (/motorway/.test(id))                      {c='#1a2a4a';w=1.2;}
+                else if (/trunk/.test(id))                    {c='#152440';w=1.1;}
+                else if (/primary/.test(id))                  {c='#112038';w=1.0;}
+                else if (/secondary/.test(id))                {c='#0d1a30';w=0.9;}
+                else if (/tertiary/.test(id))                 {c='#0a1528';w=0.8;}
+                else if (/residential|living_street/.test(id)) c='#081220';
+                else if (/service|alley/.test(id))            c='#060c16';
+                else if (/footway|path|steps/.test(id))       c='#040a12';
+                else if (/water|river|canal|stream/.test(id)) c='#020610';
+                else if (/rail|railway|transit/.test(id))     c='#0c1628';
+                else if (/bridge/.test(id))                   c='#14203c';
+                else if (/boundary|country|state/.test(id))   c='#101830';
+                map.setPaintProperty(id,'line-color',c);
+            } else if (type==='symbol') {
+                const isM=/motorway|highway/.test(id), isP=/trunk|primary/.test(id);
+                const isC=/city|capital|town|village|place/.test(id);
+                const isR=/road|street|secondary|tertiary/.test(id);
+                const isW=/water|ocean|sea|lake|river/.test(id);
+                let tc='#0a1628';
+                if(isM)tc='#1a3060'; else if(isP)tc='#142850'; else if(isC)tc='#162c54'; else if(isR)tc='#0e1830'; else if(isW)tc='#081830';
+                try{map.setPaintProperty(id,'text-color',tc);}catch(_){}
+                try{map.setPaintProperty(id,'text-halo-color','#010206');}catch(_){}
+                try{map.setPaintProperty(id,'text-halo-width',isC?1.6:isP?1.2:0.8);}catch(_){}
+                try{map.setPaintProperty(id,'icon-opacity',isC?0.4:0.08);}catch(_){}
             }
-        } catch (_) {}
+        } catch(_) {}
     });
 
-    // Add sky/atmosphere layer if not present
+    // Sky atmosphere — 5-stop gradient with horizon glow
     try {
         if (!map.getLayer('sky')) {
-            map.addLayer({ id:'sky', type:'sky', paint:{
+            map.addLayer({id:'sky',type:'sky',paint:{
                 'sky-type':'gradient',
                 'sky-gradient':['interpolate',['linear'],['sky-radial-progress'],
-                    0.8,'rgba(2,5,18,1)', 1,'rgba(4,8,22,1)'],
-                'sky-gradient-center':[0,0],
-                'sky-gradient-radius':90,
-                'sky-opacity':['interpolate',['linear'],['zoom'],0,0,8,1]
+                    0,'rgba(1,2,6,1)',0.2,'rgba(2,4,12,1)',0.5,'rgba(3,6,18,1)',0.8,'rgba(4,8,22,1)',1,'rgba(6,12,30,1)'],
+                'sky-gradient-center':[0,0],'sky-gradient-radius':90,
+                'sky-opacity':['interpolate',['linear'],['zoom'],0,0,6,0.7,10,1]
             }});
         }
     } catch(_) {}
 
-    // Road casing (dark border under roads for depth)
+    // Atmospheric fog — exponential depth for 3D feel
     try {
-        const existing = map.getLayer('_3rc');
-        if (!existing) {
-            const srcs = map.getStyle()?.sources || {};
-            const sk = Object.keys(srcs).find(k => k==='openmaptiles'||/tile|planet|basemap/.test(k));
-            if (sk) {
-                map.addLayer({ id:'_3rc', source:sk, 'source-layer':'transportation', type:'line', minzoom:12,
-                    layout:{'line-join':'round','line-cap':'round'},
+        map.setFog({
+            color:'#030810',
+            'high-color':'#060e1e',
+            'horizon-blend':0.08,
+            'space-color':'#010206',
+            'star-intensity':0.15,
+            range:[1.0, 12.0]
+        });
+    } catch(_) {}
+
+    // Road casing — dark edges on major roads
+    try {
+        if (!map.getLayer('_3rc')) {
+            const srcs=map.getStyle()?.sources||{};
+            const sk=Object.keys(srcs).find(k=>k==='openmaptiles'||/tile|planet|basemap/.test(k));
+            if(sk){
+                map.addLayer({id:'_3rc',source:sk,'source-layer':'transportation',type:'line',minzoom:11,
+                    layout:{'line-join':'round','line-cap':'butt'},
                     paint:{
-                        'line-color':'rgba(0,0,0,.8)',
+                        'line-color':['case',
+                            ['==',['get','class'],'motorway'],'#060c18',
+                            ['==',['get','class'],'trunk'],'#050a14',
+                            ['==',['get','class'],'primary'],'#040810',
+                            '#030608'],
                         'line-width':['interpolate',['linear'],['zoom'],
-                            12,['case',['==',['get','class'],'motorway'],5,['==',['get','class'],'primary'],3,1.5],
-                            18,['case',['==',['get','class'],'motorway'],14,['==',['get','class'],'primary'],9,3.5]],
-                        'line-gap-width':0,
+                            11,['case',['==',['get','class'],'motorway'],5,['==',['get','class'],'primary'],3,1.5],
+                            16,['case',['==',['get','class'],'motorway'],18,['==',['get','class'],'primary'],12,5],
+                            20,['case',['==',['get','class'],'motorway'],28,['==',['get','class'],'primary'],18,8]],
+                        'line-opacity':['interpolate',['linear'],['zoom'],11,0.4,14,0.9]
                     }
-                }, '_3rG');  // insert below route layers
+                },'_3rG');
             }
         }
     } catch(_) {}
 }
 
-/* ── 4-layer building extrusions ───────────────────────────── */
+/* ── 7-layer premium buildings — Tesla/Google-level ─────── */
 function _3dmBuildings(map) {
-    const srcs = map.getStyle()?.sources || {};
-    const sk = Object.keys(srcs).find(k =>
-        k==='openmaptiles'||k==='maptiler'||/tile|planet|basemap/.test(k));
-    if (!sk) return;
-
-    const hExpr = ['coalesce',['get','render_height'],['get','height'],['get','building:height'],8];
-    const bExpr = ['coalesce',['get','render_min_height'],['get','min_height'],['get','building:min_height'],0];
-    const hAnim = ['interpolate',['linear'],['zoom'],13.5,0,15,hExpr];
-    const bAnim = ['interpolate',['linear'],['zoom'],13.5,0,15,bExpr];
-    const oAnim = ['interpolate',['linear'],['zoom'],13,0,14.5,1];
-
+    const srcs=map.getStyle()?.sources||{};
+    const sk=Object.keys(srcs).find(k=>k==='openmaptiles'||k==='maptiler'||/tile|planet|basemap/.test(k));
+    if(!sk) return;
+    const hE=['coalesce',['get','render_height'],['get','height'],['get','building:height'],8];
+    const bE=['coalesce',['get','render_min_height'],['get','min_height'],['get','building:min_height'],0];
+    const hA=['interpolate',['linear'],['zoom'],13.5,0,15,hE];
+    const bA=['interpolate',['linear'],['zoom'],13.5,0,15,bE];
     try {
-        map.setLight({
-            anchor: 'viewport',
-            color: 'hsl(210, 50%, 90%)',
-            position: [1.15, 210, 40], // Light azimuth and elevation casting deep dramatic shadows
-            intensity: 0.55
-        });
+        // Upgraded directional lighting
+        try{map.setLight({anchor:'viewport',color:'hsl(220,55%,80%)',position:[1.5,210,50],intensity:0.7});}catch(_){}
 
-        // Layer 1: Offset ground shadow (ambient occlusion trick)
-        map.addLayer({ id:'_3bs', source:sk, 'source-layer':'building', type:'fill-extrusion', minzoom:13,
-            paint:{
-                'fill-extrusion-color':'#020409',
-                'fill-extrusion-height':hExpr, 'fill-extrusion-base':bExpr,
-                'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],13,0,14.5,0.75],
-                'fill-extrusion-translate':[6,9], 'fill-extrusion-translate-anchor':'viewport',
-            }});
+        // L1 — Deep ground shadow (wide offset for dramatic depth)
+        map.addLayer({id:'_3bs',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:13,
+            paint:{'fill-extrusion-color':'#000204',
+                   'fill-extrusion-height':hE,'fill-extrusion-base':bE,
+                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],13,0,14.5,0.85],
+                   'fill-extrusion-translate':[8,12],'fill-extrusion-translate-anchor':'viewport'}});
 
-        // Layer 2: Main body — dynamic vertical gradient with richer cyans
-        map.addLayer({ id:'_3bm', source:sk, 'source-layer':'building', type:'fill-extrusion', minzoom:13,
-            paint:{
-                'fill-extrusion-color':['interpolate',['linear'],['zoom'],
-                    13,'#081226', 14,'#09162e', 15,'#0a1936', 16,'#0e2142', 17,'#102852', 18,'#153266'],
-                'fill-extrusion-height':hAnim, 'fill-extrusion-base':bAnim,
-                'fill-extrusion-opacity':oAnim,
-                'fill-extrusion-vertical-gradient':true,
-                'fill-extrusion-ambient-occlusion-intensity':1.0, 
-                'fill-extrusion-ambient-occlusion-radius':6,
-            }});
+        // L2 — Main body with deep vertical gradient + ambient occlusion
+        map.addLayer({id:'_3bm',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:13,
+            paint:{'fill-extrusion-color':['interpolate',['linear'],['zoom'],
+                       13,'#060c18',14,'#081220',15,'#0a1830',16,'#0c1e3c',17,'#0e244a',18,'#102a56'],
+                   'fill-extrusion-height':hA,'fill-extrusion-base':bA,
+                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],13,0,14.5,1],
+                   'fill-extrusion-vertical-gradient':true,
+                   'fill-extrusion-ambient-occlusion-intensity':1.0,'fill-extrusion-ambient-occlusion-radius':8}});
 
-        // Layer 3: Tall buildings (>20m) — warm copper/amber highlights
-        // India has many old structures with warm stone/brick tones
-        map.addLayer({ id:'_3ba', source:sk, 'source-layer':'building', type:'fill-extrusion', minzoom:15,
+        // L3 — Edge highlight (thin bright outline for 3D depth perception)
+        map.addLayer({id:'_3be',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:14,
+            paint:{'fill-extrusion-color':['interpolate',['linear'],['zoom'],14,'#0e1e3a',17,'#1a3060',19,'#264080'],
+                   'fill-extrusion-height':hE,'fill-extrusion-base':bE,
+                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],14,0,16,0.28,19,0.45],
+                   'fill-extrusion-translate':[-1.5,-1.5],'fill-extrusion-translate-anchor':'viewport'}});
+
+        // L4 — Warm face accent for medium buildings (≥15m)
+        map.addLayer({id:'_3bw',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:14,
+            filter:['>=',['coalesce',['get','height'],0],15],
+            paint:{'fill-extrusion-color':['interpolate',['linear'],['zoom'],14,'#0a1828',17,'#0e2240'],
+                   'fill-extrusion-height':hE,'fill-extrusion-base':bE,
+                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],14,0,16,0.32],
+                   'fill-extrusion-translate':[-3,-3],'fill-extrusion-translate-anchor':'viewport'}});
+
+        // L5 — Cool blue accent for tall buildings (≥35m)
+        map.addLayer({id:'_3ba',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:15,
+            filter:['>=',['coalesce',['get','height'],0],35],
+            paint:{'fill-extrusion-color':['interpolate',['linear'],['zoom'],15,'#0e1e42',18,'#1a3878'],
+                   'fill-extrusion-height':hE,'fill-extrusion-base':bE,
+                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],15,0,17,0.38],
+                   'fill-extrusion-translate':[-5,-5],'fill-extrusion-translate-anchor':'viewport'}});
+
+        // L6 — Roof cap glow (subtle top highlight)
+        map.addLayer({id:'_3br',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:16,
+            paint:{'fill-extrusion-color':['interpolate',['linear'],['zoom'],16,'#1a3060',19,'#2a6aff'],
+                   'fill-extrusion-height':hE,
+                   'fill-extrusion-base':['max',['coalesce',['get','height'],0],0.15],
+                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],15,0,17,0.40,20,0.70]}});
+
+        // L7 — Window lights on tall buildings (warm scattered effect)
+        map.addLayer({id:'_3bwl',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:16,
             filter:['>=',['coalesce',['get','height'],0],20],
-            paint:{
-                'fill-extrusion-color':'#0c213d',
-                'fill-extrusion-height':hExpr, 'fill-extrusion-base':bExpr,
-                'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],15,0,16.5,0.45],
-                'fill-extrusion-translate':[-3,-3], 'fill-extrusion-translate-anchor':'viewport',
-            }});
-
-        // Layer 4: Roof caps — highly luminous neon cyan edge at very close zoom
-        map.addLayer({ id:'_3br', source:sk, 'source-layer':'building', type:'fill-extrusion', minzoom:16,
-            paint:{
-                'fill-extrusion-color':['interpolate',['linear'],['zoom'],16,'#1e406e',19,'#2a7bff'],
-                'fill-extrusion-height':hExpr,
-                'fill-extrusion-base':['max',['coalesce',['get','height'],0],0.2],
-                'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],15,0,17,0.4,20,0.65],
-            }});
-
-    } catch(e) { console.warn('[3D buildings]', e); }
+            paint:{'fill-extrusion-color':['interpolate',['linear'],['zoom'],16,'#1a2840',18,'#2a4068',20,'#3a5890'],
+                   'fill-extrusion-height':['*',hE,0.92],
+                   'fill-extrusion-base':['*',['max',['coalesce',['get','height'],0],1],0.15],
+                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],16,0,18,0.18,20,0.30],
+                   'fill-extrusion-vertical-gradient':true}});
+    } catch(e){console.warn('[3D buildings]',e);}
 }
 
-/* ── Accuracy ring (GeoJSON circle) ────────────────────────── */
-function _3dmAccuracyGeoJSON(lat, lon, accM) {
-    const safe = Math.max(accM||5, 2), steps = 64;
-    const coords = [], latRad = lat*Math.PI/180;
-    const mpDlon = 111320*Math.cos(latRad);
-    for (let i=0; i<=steps; i++) {
-        const a = (i/steps)*2*Math.PI;
-        coords.push([lon+Math.sin(a)*safe/mpDlon, lat+Math.cos(a)*safe/111320]);
-    }
-    return { type:'Feature', geometry:{ type:'Polygon', coordinates:[coords] } };
+/* ── Accuracy ring ──────────────────────────────────────── */
+function _3dmAccuracyGeoJSON(lat,lon,accM){
+    const safe=Math.max(accM||5,2),steps=64,coords=[],latRad=lat*Math.PI/180,mpd=111320*Math.cos(latRad);
+    for(let i=0;i<=steps;i++){const a=(i/steps)*2*Math.PI;coords.push([lon+Math.sin(a)*safe/mpd,lat+Math.cos(a)*safe/111320]);}
+    return{type:'Feature',geometry:{type:'Polygon',coordinates:[coords]}};
+}
+function _3dmUpdateAccRing(lat,lon,acc){
+    if(!_3DM.map||!_3DM.styleReady)return;
+    const now=performance.now();if(now-_3DM._accTimer<600)return;_3DM._accTimer=now;
+    const data=_3dmAccuracyGeoJSON(lat,lon,acc??15);
+    try{
+        const src=_3DM.map.getSource('_3acc');
+        if(src){src.setData(data);return;}
+        _3DM.map.addSource('_3acc',{type:'geojson',data});
+        _3DM.map.addLayer({id:'_3accF',type:'fill',source:'_3acc',paint:{'fill-color':'rgba(0,220,255,.05)'}});
+        _3DM.map.addLayer({id:'_3accL',type:'line',source:'_3acc',paint:{'line-color':'rgba(0,220,255,.45)','line-width':1.5,'line-dasharray':[4,3]}});
+    }catch(_){}
 }
 
-function _3dmUpdateAccRing(lat, lon, acc) {
-    if (!_3DM.map || !_3DM.styleReady) return;
-    const data = _3dmAccuracyGeoJSON(lat, lon, acc??15);
-    try {
-        const src = _3DM.map.getSource('_3acc');
-        if (src) { src.setData(data); return; }
-        _3DM.map.addSource('_3acc', { type:'geojson', data });
-        _3DM.map.addLayer({ id:'_3accF', type:'fill', source:'_3acc',
-            paint:{ 'fill-color':'rgba(79,158,255,.07)', 'fill-antialias':true }});
-        _3DM.map.addLayer({ id:'_3accL', type:'line', source:'_3acc',
-            paint:{ 'line-color':'rgba(79,158,255,.55)', 'line-width':1.5, 'line-dasharray':[3,2.5] }});
-    } catch(_) {}
-}
+/* ── 7-layer route — cyan glow (Google/Tesla-level) ────── */
+function _3dmRouteLayer(map,coords){
+    const feat=c=>({type:'Feature',geometry:{type:'LineString',coordinates:c}});
+    const seed=coords.length>=2?[coords[0],coords[0]]:[[0,0],[0,0]];
+    map.addSource('_3r', {type:'geojson',data:feat(coords)});
+    map.addSource('_3rd',{type:'geojson',data:feat(seed)});
+    map.addSource('_3rr',{type:'geojson',data:feat(coords)});
 
-/* ── Route layers ───────────────────────────────────────────── */
-function _3dmRouteLayer(map, coords) {
-    const feat = c => ({ type:'Feature', geometry:{ type:'LineString', coordinates:c } });
-    const seed = coords.length>=2 ? [coords[0],coords[0]] : [[0,0],[0,0]];
-    map.addSource('_3r',  { type:'geojson', data:feat(coords) });
-    map.addSource('_3rd', { type:'geojson', data:feat(seed) });
-    map.addSource('_3rr', { type:'geojson', data:feat(coords) });
+    // L1 — Ultra-wide outer halo (atmospheric glow)
+    map.addLayer({id:'_3rG',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
+        paint:{'line-color':'rgba(0,220,255,.06)','line-width':['interpolate',['linear'],['zoom'],10,32,16,60,20,85],'line-blur':28}});
 
-    // Diffuse outer glow
-    map.addLayer({ id:'_3rG', type:'line', source:'_3rr',
-        layout:{'line-join':'round','line-cap':'round'},
-        paint:{ 'line-color':'rgba(0,230,118,.10)',
-                'line-width':['interpolate',['linear'],['zoom'],10,26,18,52],'line-blur':18 }});
-    // Mid glow
-    map.addLayer({ id:'_3rH', type:'line', source:'_3rr',
-        layout:{'line-join':'round','line-cap':'round'},
-        paint:{ 'line-color':'rgba(0,230,118,.30)',
-                'line-width':['interpolate',['linear'],['zoom'],10,12,18,24],'line-blur':6 }});
-    // Main route
-    map.addLayer({ id:'_3rM', type:'line', source:'_3rr',
-        layout:{'line-join':'round','line-cap':'round'},
-        paint:{ 'line-color':'#00e676',
-                'line-width':['interpolate',['linear'],['zoom'],10,4.5,18,12] }});
-    // Bright inner core
-    map.addLayer({ id:'_3rI', type:'line', source:'_3rr',
-        layout:{'line-join':'round','line-cap':'round'},
-        paint:{ 'line-color':'rgba(200,255,228,.90)',
-                'line-width':['interpolate',['linear'],['zoom'],10,1.4,18,3.5] }});
-    // Travelled segment (darker overlay)
-    map.addLayer({ id:'_3rD', type:'line', source:'_3rd',
-        layout:{'line-join':'round','line-cap':'round'},
-        paint:{ 'line-color':'rgba(0,35,18,.80)',
-                'line-width':['interpolate',['linear'],['zoom'],10,5,18,13] }});
-    // Destination dot
-    if (coords.length) {
-        const dest = coords[coords.length-1];
-        map.addSource('_3dest', { type:'geojson', data:{ type:'Feature', geometry:{ type:'Point', coordinates:dest } } });
-        map.addLayer({ id:'_3destO', type:'circle', source:'_3dest',
-            paint:{ 'circle-radius':['interpolate',['linear'],['zoom'],12,8,18,18],
-                    'circle-color':'#ff4545','circle-stroke-color':'rgba(255,255,255,.8)','circle-stroke-width':2,
-                    'circle-blur':0.1 }});
-        map.addLayer({ id:'_3destH', type:'circle', source:'_3dest',
-            paint:{ 'circle-radius':['interpolate',['linear'],['zoom'],12,16,18,36],
-                    'circle-color':'rgba(255,69,69,.15)','circle-blur':0.4 }});
+    // L2 — Mid glow
+    map.addLayer({id:'_3rH',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
+        paint:{'line-color':'rgba(0,210,240,.20)','line-width':['interpolate',['linear'],['zoom'],10,14,16,30,20,44],'line-blur':10}});
+
+    // L3 — Route body casing (dark base)
+    map.addLayer({id:'_3rC',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
+        paint:{'line-color':'rgba(0,30,40,.92)','line-width':['interpolate',['linear'],['zoom'],10,6,16,16,20,22]}});
+
+    // L4 — Main route (vivid cyan)
+    map.addLayer({id:'_3rM',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
+        paint:{'line-color':'#00dce8','line-width':['interpolate',['linear'],['zoom'],10,4.5,16,12,20,18]}});
+
+    // L5 — Inner bright core
+    map.addLayer({id:'_3rI',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
+        paint:{'line-color':'rgba(180,255,255,.88)','line-width':['interpolate',['linear'],['zoom'],10,1.5,16,3.5,20,5]}});
+
+    // L6 — Animated flow dashes
+    map.addLayer({id:'_3rF',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
+        paint:{'line-color':'rgba(255,255,255,.55)','line-width':['interpolate',['linear'],['zoom'],10,2.5,16,5,20,7],
+               'line-dasharray':[3,6]}});
+
+    // L7 — Travelled overlay (darkened path behind)
+    map.addLayer({id:'_3rD',type:'line',source:'_3rd',layout:{'line-join':'round','line-cap':'round'},
+        paint:{'line-color':'rgba(0,20,30,.85)','line-width':['interpolate',['linear'],['zoom'],10,5,16,14,20,20]}});
+
+    // Destination marker — pulsing red with halo
+    if(coords.length){
+        const dest=coords[coords.length-1];
+        map.addSource('_3dest',{type:'geojson',data:{type:'Feature',geometry:{type:'Point',coordinates:dest}}});
+        map.addLayer({id:'_3destH',type:'circle',source:'_3dest',
+            paint:{'circle-radius':['interpolate',['linear'],['zoom'],12,22,18,48],'circle-color':'rgba(255,60,60,.12)','circle-blur':0.6}});
+        map.addLayer({id:'_3destO',type:'circle',source:'_3dest',
+            paint:{'circle-radius':['interpolate',['linear'],['zoom'],12,9,18,20],'circle-color':'#ff4545',
+                   'circle-stroke-color':'rgba(255,255,255,.90)','circle-stroke-width':3}});
+        map.addLayer({id:'_3destP',type:'circle',source:'_3dest',
+            paint:{'circle-radius':4.5,'circle-color':'rgba(255,255,255,.98)','circle-stroke-color':'#ff4545','circle-stroke-width':2.5}});
+
+        // Start marker — cyan glow
+        const start=coords[0];
+        map.addSource('_3strt',{type:'geojson',data:{type:'Feature',geometry:{type:'Point',coordinates:start}}});
+        map.addLayer({id:'_3strtH',type:'circle',source:'_3strt',
+            paint:{'circle-radius':['interpolate',['linear'],['zoom'],12,16,18,36],'circle-color':'rgba(0,220,255,.10)','circle-blur':0.5}});
+        map.addLayer({id:'_3strtO',type:'circle',source:'_3strt',
+            paint:{'circle-radius':['interpolate',['linear'],['zoom'],12,7,18,14],'circle-color':'#00dce8',
+                   'circle-stroke-color':'rgba(255,255,255,.85)','circle-stroke-width':2.5}});
     }
 }
 
-/* ── Update route layers (throttled) ───────────────────────── */
-function _3dmUpdateRoute(lat, lon) {
-    if (!_3DM.map || !_3DM.styleReady) return;
-    const lls = _3DM.routeLLs;
-    if (lls.length < 2) return;
-    const now = performance.now();
-    if (now - _3DM._routeUpdateTimer < 250) return;  // max 4/s
-    _3DM._routeUpdateTimer = now;
-    try {
-        const near = _nearestPointOnRoute(lat, lon, lls);
-        const doneLL   = [...lls.slice(0,near.idx+1),[near.lat,near.lon]];
-        const remainLL = [[near.lat,near.lon],...lls.slice(near.idx+1)];
-        const toC = arr => arr.map(([a,b])=>[b,a]);
-        _3DM.map.getSource('_3rd')?.setData({ type:'Feature', geometry:{ type:'LineString', coordinates:toC(doneLL) } });
-        _3DM.map.getSource('_3rr')?.setData({ type:'Feature', geometry:{ type:'LineString', coordinates:toC(remainLL) } });
-        let d=0;
-        for (let i=0;i<doneLL.length-1;i++) d+=_haversineJS(doneLL[i][0],doneLL[i][1],doneLL[i+1][0],doneLL[i+1][1]);
+/* ── Animate flow dashes — smoother 60ms cycle ─────────── */
+let _3dmDashStep=0;
+function _3dmAnimateDashes(){
+    if(!_3DM.map||!_3DM.styleReady)return;
+    const now=performance.now();if(now-_3DM._dashTs<60)return;_3DM._dashTs=now;
+    _3dmDashStep=(_3dmDashStep+0.35)%9;
+    try{
+        const d=_3dmDashStep;
+        _3DM.map.setPaintProperty('_3rF','line-dasharray',[Math.max(0.1,3-d%3),Math.max(0.1,6-d%6)]);
+    }catch(_){}
+}
+
+/* ── Update route ───────────────────────────────────────── */
+function _3dmUpdateRoute(lat,lon){
+    if(!_3DM.map||!_3DM.styleReady)return;
+    const lls=_3DM.routeLLs;if(lls.length<2)return;
+    const now=performance.now();if(now-_3DM._routeTimer<200)return;_3DM._routeTimer=now;
+    try{
+        const near=_nearestPointOnRoute(lat,lon,lls);
+        const doneLL=[...lls.slice(0,near.idx+1),[near.lat,near.lon]];
+        const remainLL=[[near.lat,near.lon],...lls.slice(near.idx+1)];
+        const toC=a=>a.map(([x,y])=>[y,x]);
+        _3DM.map.getSource('_3rd')?.setData({type:'Feature',geometry:{type:'LineString',coordinates:toC(doneLL)}});
+        _3DM.map.getSource('_3rr')?.setData({type:'Feature',geometry:{type:'LineString',coordinates:toC(remainLL)}});
+        let d=0;for(let i=0;i<doneLL.length-1;i++)d+=_haversineJS(doneLL[i][0],doneLL[i][1],doneLL[i+1][0],doneLL[i+1][1]);
         _3DM.travelledDist=d;
-    } catch(_) {}
+    }catch(_){}
 }
 
-/* ── Vehicle marker ─────────────────────────────────────────── */
-function _3dmAddVehicle(map, lon, lat, bear, key) {
-    if (!map||!isFinite(lon)||!isFinite(lat)) return;
-    const el = document.createElement('div');
-    el.innerHTML = _3dmMarkerHTML(key);
-    el.style.cssText = 'pointer-events:none;transform-origin:center center';
-    try {
-        _3DM.vehicleMarker = new maplibregl.Marker({
-            element:el, rotationAlignment:'map', pitchAlignment:'map', anchor:'center',
-        }).setLngLat([lon,lat]).setRotation(bear).addTo(map);
-    } catch(e) { console.warn('[3D vehicle]',e); }
+/* ── Vehicle marker ─────────────────────────────────────── */
+function _3dmAddVehicle(map,lon,lat,bear,key){
+    if(!map||!isFinite(lon)||!isFinite(lat))return;
+    const el=document.createElement('div');
+    el.innerHTML=_3dmMarkerHTML(key);
+    el.style.cssText='pointer-events:none;transform-origin:center center';
+    try{
+        _3DM.vehicleMarker=new maplibregl.Marker({element:el,rotationAlignment:'map',pitchAlignment:'map',anchor:'center'})
+            .setLngLat([lon,lat]).setRotation(bear).addTo(map);
+    }catch(e){console.warn('[3D vehicle]',e);}
 }
 
-/* ── Device orientation ─────────────────────────────────────── */
-function _3dmStartDeviceOrientation() {
-    if (_3DM._devOrFn) return;
-    const handler = e => {
-        if (!_3DM.active) return;
-        const alpha = e.webkitCompassHeading ?? (e.alpha!=null ? (360-e.alpha) : null);
-        if (alpha==null) return;
-        _3DM.devBearing=alpha; _3DM.devOrient=true;
-    };
-    window.addEventListener('deviceorientationabsolute', handler, {passive:true});
-    window.addEventListener('deviceorientation', handler, {passive:true});
-    _3DM._devOrFn=handler;
+/* ── Device orientation ─────────────────────────────────── */
+function _3dmStartDeviceOrientation(){
+    if(_3DM._devOrFn)return;
+    const h=e=>{if(!_3DM.active)return;const a=e.webkitCompassHeading??(e.alpha!=null?(360-e.alpha):null);if(a==null)return;_3DM.devBearing=a;_3DM.devOrient=true;};
+    window.addEventListener('deviceorientationabsolute',h,{passive:true});
+    window.addEventListener('deviceorientation',h,{passive:true});
+    _3DM._devOrFn=h;
 }
-function _3dmStopDeviceOrientation() {
-    if (!_3DM._devOrFn) return;
-    window.removeEventListener('deviceorientationabsolute', _3DM._devOrFn);
-    window.removeEventListener('deviceorientation', _3DM._devOrFn);
-    _3DM._devOrFn=null; _3DM.devOrient=false;
+function _3dmStopDeviceOrientation(){
+    if(!_3DM._devOrFn)return;
+    window.removeEventListener('deviceorientationabsolute',_3DM._devOrFn);
+    window.removeEventListener('deviceorientation',_3DM._devOrFn);
+    _3DM._devOrFn=null;_3DM.devOrient=false;
 }
 
-/* ── Camera follow — position + optional heading ────────────── */
-function _3dmFollowCam(dt) {
-    if (!_3DM.map||!_3DM.styleReady||_3DM.rndLat===null) return;
-    // Don't override map while user is actively interacting
-    if (_3DM.userRotating||(_3DM.map.isMoving&&_3DM.map.isMoving()&&!_3DM.followMode)) return;
+/* ── Speed-reactive zoom — Tesla-level close view ──────── */
+function _3dmSpeedZoom(kmh){
+    if(kmh<2)  return 18.8;
+    if(kmh<15) return 18.2;
+    if(kmh<40) return 17.4;
+    if(kmh<80) return 16.8;
+    return 16.2;
+}
 
-    const jumpProps = { pitch:_3DM.pitchMode };
-
-    if (_3DM.followMode) {
-        const aPos = Math.min(1, dt*5.5);
-        _3DM.camLat += (_3DM.rndLat-_3DM.camLat)*aPos;
-        _3DM.camLon += (_3DM.rndLon-_3DM.camLon)*aPos;
-        jumpProps.center = [_3DM.camLon, _3DM.camLat];
-        jumpProps.zoom = _3DM.zoomNav;
+/* ── Camera follow — smoother Tesla-level chase cam ────── */
+function _3dmFollowCam(dt){
+    if(!_3DM.map||!_3DM.styleReady||_3DM.rndLat===null)return;
+    if(_3DM.userRotating||(_3DM.map.isMoving?.()&&!_3DM.followMode))return;
+    const jp={pitch:_3DM.pitchMode};
+    if(_3DM.followMode){
+        const aPos=Math.min(1,dt*6.5);
+        _3DM.camLat+=(_3DM.rndLat-_3DM.camLat)*aPos;
+        _3DM.camLon+=(_3DM.rndLon-_3DM.camLon)*aPos;
+        jp.center=[_3DM.camLon,_3DM.camLat];
+        const spd=_navActive?userSpeedKmh:0;
+        const tZ=_3dmSpeedZoom(spd);
+        _3DM.zoomNav+=((tZ)-_3DM.zoomNav)*Math.min(1,dt*1.2);
+        jp.zoom=_3DM.zoomNav;
     }
-
-    if (_3DM.followHeading) {
-        const aBear = Math.min(1, dt*4.8);
-        const bd = _angleDiff(_3DM.camBearing, _3DM.tgtBearing);
-        _3DM.camBearing = (_3DM.camBearing + bd*aBear + 360) % 360;
-        jumpProps.bearing = _3DM.camBearing;
+    if(_3DM.followHeading){
+        const aBear=Math.min(1,dt*5.5);
+        const bd=_angleDiff(_3DM.camBearing,_3DM.tgtBearing);
+        _3DM.camBearing=(_3DM.camBearing+bd*aBear+360)%360;
+        jp.bearing=_3DM.camBearing;
     }
-
-    if (Object.keys(jumpProps).length > 1) {
-        try { _3DM.map.jumpTo(jumpProps); } catch(_) {}
-    }
-
-    // Sync compass (always — even when not following)
-    const realBearing = _3DM.followHeading ? _3DM.camBearing : (_3DM.map?.getBearing()??0);
-    const cp = $('nav3d-compass');
-    if (cp) cp.style.transform = `rotate(${-realBearing}deg)`;
+    if(Object.keys(jp).length>1){try{_3DM.map.jumpTo(jp);}catch(_){}}
+    const rb=_3DM.followHeading?_3DM.camBearing:(_3DM.map?.getBearing()??0);
+    const cp=$('nav3d-compass');if(cp)cp.style.transform=`rotate(${-rb}deg)`;
 }
 
-/* ── Speed colour ────────────────────────────────────────────── */
-function _3dmSpeedColor(kmh) {
-    if (kmh<1)  return '#4a6a8a';
-    if (kmh<30) return '#00e676';
-    if (kmh<60) return '#4f9eff';
-    if (kmh<90) return '#ffd740';
+/* ── Speed colour — cyan-themed ─────────────────────────── */
+function _3dmSpeedColor(kmh){
+    if(kmh<1)  return '#3a5a7a';
+    if(kmh<30) return '#00dce8';
+    if(kmh<60) return '#00e676';
+    if(kmh<90) return '#ffd740';
     return '#ff4545';
 }
 
-/* ── HUD update ──────────────────────────────────────────────── */
-function _3dmHUD() {
-    const spd = _navActive ? Math.round(userSpeedKmh||0) : 0;
-    const sEl=$('nav3d-speed'), sBadge=$('nav3d-speed-badge');
-    if (sEl) sEl.textContent=spd;
-    if (sBadge) {
-        sBadge.style.borderColor=_3dmSpeedColor(spd);
-        sBadge.style.boxShadow=spd>2?`0 0 16px ${_3dmSpeedColor(spd)}44,inset 0 0 20px ${_3dmSpeedColor(spd)}10`:'';
-    }
-    const dEl=$('nav3d-dist'), eEl=$('nav3d-eta');
-    const nhDist=$('nav-hud-dist'), nhTime=$('nav-hud-time');
+/* ── HUD ────────────────────────────────────────────────── */
+function _3dmHUD(){
+    const spd=_navActive?Math.round(userSpeedKmh||0):0;
+    const sEl=$('nav3d-speed'),sBadge=$('nav3d-speed-badge');
+    if(sEl)sEl.textContent=spd;
+    if(sBadge){const sc=_3dmSpeedColor(spd);sBadge.style.borderColor=sc;sBadge.style.boxShadow=spd>2?`0 0 18px ${sc}50,inset 0 0 20px ${sc}10`:'inset 0 0 20px rgba(79,158,255,.05)';}
+    const dEl=$('nav3d-dist'),eEl=$('nav3d-eta');
+    const nhDist=$('nav-hud-dist'),nhTime=$('nav-hud-time');
     const rem=Math.max(0,_3DM.totalDist-_3DM.travelledDist);
-    if (dEl) dEl.textContent=(_navActive&&nhDist?.textContent)?nhDist.textContent:_3dmFmtD(rem);
-    if (eEl) eEl.textContent=(_navActive&&nhTime?.textContent)?nhTime.textContent:_3dmFmtT(rem);
+    if(dEl)dEl.textContent=(_navActive&&nhDist?.textContent&&nhDist.textContent!=='—')?nhDist.textContent:_3dmFmtD(rem);
+    if(eEl)eEl.textContent=(_navActive&&nhTime?.textContent&&nhTime.textContent!=='—')?nhTime.textContent:_3dmFmtT(rem);
     const dirs=['↑','↗','→','↘','↓','↙','←','↖'];
-    const dArr=$('nav3d-dir-arrow');
-    if (dArr) dArr.textContent=dirs[Math.round(_3DM.tgtBearing/45)%8];
-    const tDist=$('nav3d-turn-dist');
-    if (tDist) tDist.textContent=(_navActive&&nhDist?.textContent)?nhDist.textContent:_3dmFmtD(rem);
-    const nhStreet=$('nav-hud-street'), streetEl=$('nav3d-turn-street');
-    if (streetEl) streetEl.textContent=(_navActive&&nhStreet?.textContent)?nhStreet.textContent:_bearingToDirection(_3DM.tgtBearing);
-    // Follow indicator on recenter button
-    const rcBtn=$('nav3d-recenter');
-    if (rcBtn) {
-        const lost=!_3DM.followMode||!_3DM.followHeading;
-        rcBtn.classList.toggle('active',lost);
-        rcBtn.title=lost?'Re-center & lock heading':'Following GPS';
-    }
-    // GPS status
+    const dArr=$('nav3d-dir-arrow');if(dArr)dArr.textContent=dirs[Math.round(_3DM.tgtBearing/45)%8];
+    const tDist=$('nav3d-turn-dist');if(tDist)tDist.textContent=(_navActive&&nhDist?.textContent&&nhDist.textContent!=='—')?nhDist.textContent:_3dmFmtD(rem);
+    const nhStreet=$('nav-hud-street'),streetEl=$('nav3d-turn-street');
+    if(streetEl)streetEl.textContent=(_navActive&&nhStreet?.textContent&&nhStreet.textContent.length>3)?nhStreet.textContent:_bearingToDirection(_3DM.tgtBearing);
+    const rcBtn=$('nav3d-recenter');if(rcBtn){const lost=!_3DM.followMode||!_3DM.followHeading;rcBtn.classList.toggle('active',lost);}
     const gpsStat=$('nav3d-gps-status');
-    if (gpsStat) {
-        if (!_navActive) { gpsStat.textContent='⬛ Tap Navigate to begin'; gpsStat.style.color='rgba(79,158,255,.5)'; }
-        else if (_gpsUsingFallback||userLat===null) { gpsStat.textContent='📡 Acquiring GPS…'; gpsStat.style.color='rgba(255,173,0,.7)'; }
-        else {
-            const acc=_lastFixAccuracy;
-            const aStr=(acc&&acc<9999)?`±${Math.round(acc)}m`:'';
-            gpsStat.textContent=`📍 GPS ${aStr}${_3DM.devOrient?' 🧭':''}`;
-            gpsStat.style.color=acc<15?'rgba(0,230,118,.8)':acc<50?'rgba(255,215,0,.75)':'rgba(255,120,0,.75)';
-        }
+    if(gpsStat){
+        if(!_navActive){gpsStat.textContent='⬛ Tap Navigate first';gpsStat.style.color='rgba(79,158,255,.45)';}
+        else if(_gpsUsingFallback||userLat===null){gpsStat.textContent='📡 Acquiring GPS…';gpsStat.style.color='rgba(255,173,0,.75)';}
+        else{const acc=_lastFixAccuracy;const aStr=(acc&&acc<9999)?`±${Math.round(acc)}m`:'';gpsStat.textContent=`📍 GPS ${aStr}${_3DM.devOrient?' 🧭':''}`;gpsStat.style.color=acc<15?'rgba(0,230,118,.85)':acc<50?'rgba(255,215,0,.8)':'rgba(255,120,0,.8)';}
     }
-    // Heading lock button indicator
-    const hBtn=$('nav3d-heading-lock');
-    if (hBtn) hBtn.classList.toggle('is-active',_3DM.followHeading);
-    // Progress
+    const hBtn=$('nav3d-heading-lock');if(hBtn)hBtn.classList.toggle('is-active',_3DM.followHeading);
     const pFill=$('nav3d-progress-fill');
-    if (pFill&&_3DM.totalDist>0) pFill.style.width=`${Math.min(100,(_3DM.travelledDist/_3DM.totalDist)*100).toFixed(1)}%`;
+    if(pFill&&_3DM.totalDist>0)pFill.style.width=`${Math.min(100,(_3DM.travelledDist/_3DM.totalDist)*100).toFixed(1)}%`;
 }
 function _3dmFmtD(m){if(!isFinite(m)||m<=0)return '—';return m<1000?`${Math.round(m)}m`:`${(m/1000).toFixed(1)}km`;}
-function _3dmFmtT(rem){if(!isFinite(rem)||rem<=0)return '—';const sp=_navActive?(userSpeedKmh>3?userSpeedKmh:30):30;return `${Math.max(1,Math.round((rem/1000)/sp*60))} min`;}
+function _3dmFmtT(rem){if(!isFinite(rem)||rem<=0)return '—';const sp=_navActive?(userSpeedKmh>3?userSpeedKmh:30):30;const min=Math.max(1,Math.round((rem/1000)/sp*60));return min<60?`${min} min`:`${Math.floor(min/60)}h ${min%60}m`;}
 
-/* ── Main RAF loop — REAL GPS ONLY ──────────────────────────── */
-function _3dmLoop(ts) {
-    if (!_3DM.active) return;
+/* ── Main loop ──────────────────────────────────────────── */
+function _3dmLoop(ts){
+    if(!_3DM.active)return;
     const dt=_3DM.lastTs?Math.min((ts-_3DM.lastTs)/1000,0.08):0.016;
     _3DM.lastTs=ts;
-
-    // 1. Real Kalman-filtered GPS — never simulate
-    if (userLat!==null&&userLon!==null&&!_gpsUsingFallback) {
-        _3DM.curLat=userLat; _3DM.curLon=userLon; _3DM.curAcc=_lastFixAccuracy??15;
-    }
-    if (_3DM.curLat===null) { _3dmHUD(); _3DM.rafId=requestAnimationFrame(_3dmLoop); return; }
-
-    // 2. Smooth render position (exponential lag)
-    if (_3DM.rndLat===null) { _3DM.rndLat=_3DM.curLat; _3DM.rndLon=_3DM.curLon; }
-    else {
-        const aPos=Math.min(1,dt*8.5);
-        _3DM.rndLat+=(_3DM.curLat-_3DM.rndLat)*aPos;
-        _3DM.rndLon+=(_3DM.curLon-_3DM.rndLon)*aPos;
-    }
-
-    // 3. Best heading — GPS when fast, device orient when slow
-    if (_navActive&&userHeading!==null&&userSpeedKmh>2.5) {
-        _3DM.gpsBearing=userHeading;
-        if (_3DM.followHeading) _3DM.tgtBearing=userHeading;
-    } else if (_3DM.devOrient&&_3DM.followHeading) {
-        _3DM.tgtBearing=_3DM.devBearing;
-    }
-
-    // 4. Vehicle marker
-    if (_3DM.vehicleMarker&&_3DM.styleReady) {
-        try { _3DM.vehicleMarker.setLngLat([_3DM.rndLon,_3DM.rndLat]); _3DM.vehicleMarker.setRotation(_3DM.tgtBearing); } catch(_) {}
-    }
-
-    // 5. Accuracy ring
-    if (_3DM.styleReady) _3dmUpdateAccRing(_3DM.rndLat,_3DM.rndLon,_3DM.curAcc);
-
-    // 6. Route
-    if (_3DM.styleReady&&_navActive&&_3DM.routeLLs.length>=2) _3dmUpdateRoute(_3DM.rndLat,_3DM.rndLon);
-
-    // 7. Camera + HUD
-    _3dmFollowCam(dt);
-    _3dmHUD();
-
+    if(userLat!==null&&userLon!==null&&!_gpsUsingFallback){_3DM.curLat=userLat;_3DM.curLon=userLon;_3DM.curAcc=_lastFixAccuracy??15;}
+    if(_3DM.curLat===null){_3dmHUD();_3DM.rafId=requestAnimationFrame(_3dmLoop);return;}
+    if(_3DM.rndLat===null){_3DM.rndLat=_3DM.curLat;_3DM.rndLon=_3DM.curLon;}
+    else{const a=Math.min(1,dt*9.0);_3DM.rndLat+=(_3DM.curLat-_3DM.rndLat)*a;_3DM.rndLon+=(_3DM.curLon-_3DM.rndLon)*a;}
+    if(_navActive&&userHeading!==null&&userSpeedKmh>2.5){_3DM.gpsBearing=userHeading;if(_3DM.followHeading)_3DM.tgtBearing=userHeading;}
+    else if(_3DM.devOrient&&_3DM.followHeading){_3DM.tgtBearing=_3DM.devBearing;}
+    if(_3DM.vehicleMarker&&_3DM.styleReady){try{_3DM.vehicleMarker.setLngLat([_3DM.rndLon,_3DM.rndLat]);_3DM.vehicleMarker.setRotation(_3DM.tgtBearing);}catch(_){}}
+    if(_3DM.styleReady)_3dmUpdateAccRing(_3DM.rndLat,_3DM.rndLon,_3DM.curAcc);
+    if(_3DM.styleReady&&_navActive&&_3DM.routeLLs.length>=2)_3dmUpdateRoute(_3DM.rndLat,_3DM.rndLon);
+    if(_3DM.styleReady)_3dmAnimateDashes();
+    _3dmFollowCam(dt);_3dmHUD();
     _3DM.rafId=requestAnimationFrame(_3dmLoop);
 }
 
-/* ── Route distance ──────────────────────────────────────────── */
 function _3dComputeRouteLen(lls){let d=0;for(let i=0;i+1<lls.length;i++)d+=_haversineJS(lls[i][0],lls[i][1],lls[i+1][0],lls[i+1][1]);return d;}
 
-/* ── Open 3D view ────────────────────────────────────────────── */
-function open3DView(routeIdx) {
+/* ── Open 3D ────────────────────────────────────────────── */
+function open3DView(routeIdx){
     const idx=(routeIdx!=null)?routeIdx:(_navRouteIdx??0);
     const grp=routeGrps[idx];
-    if (!grp?.lls?.length||grp.lls.length<2){showError('Search a route first.',4000);return;}
-    if (typeof maplibregl==='undefined'){showError('3D map not ready.',3500);return;}
-    if (_3DM.active) close3DView();
-
-    _3DM.routeLLs=grp.lls.slice();
-    _3DM.routeCoords=grp.lls.map(([a,b])=>[b,a]);
-    _3DM.totalDist=_3dComputeRouteLen(grp.lls);
-    _3DM.travelledDist=0; _3DM._routeUpdateTimer=0;
-
+    if(!grp?.lls?.length||grp.lls.length<2){showError('Search a route first.',4000);return;}
+    if(typeof maplibregl==='undefined'){showError('3D map loading…',3500);return;}
+    if(_3DM.active)close3DView();
+    _3DM.routeLLs=grp.lls.slice();_3DM.routeCoords=grp.lls.map(([a,b])=>[b,a]);
+    _3DM.totalDist=_3dComputeRouteLen(grp.lls);_3DM.travelledDist=0;_3DM._routeTimer=0;_3DM._accTimer=0;
     const hasGPS=userLat!==null&&userLon!==null&&!_gpsUsingFallback;
-    const sLat=hasGPS?userLat:grp.lls[0][0];
-    const sLon=hasGPS?userLon:grp.lls[0][1];
+    const sLat=hasGPS?userLat:grp.lls[0][0],sLon=hasGPS?userLon:grp.lls[0][1];
     const sBear=grp.lls.length>=2?_bearingDeg(grp.lls[0][0],grp.lls[0][1],grp.lls[1][0],grp.lls[1][1]):0;
-
-    Object.assign(_3DM,{
-        active:true,styleReady:false,lastTs:null,
-        followMode:true,followHeading:true,userRotating:false,
+    Object.assign(_3DM,{active:true,styleReady:false,lastTs:null,followMode:true,followHeading:true,userRotating:false,
         curLat:hasGPS?userLat:null,curLon:hasGPS?userLon:null,curAcc:_lastFixAccuracy??20,
-        rndLat:hasGPS?userLat:null,rndLon:hasGPS?userLon:null,
-        camLat:sLat,camLon:sLon,camBearing:sBear,
-        tgtBearing:hasGPS?(userHeading??sBear):sBear,gpsBearing:sBear,
-    });
-
-    const ov=$('nav-3d-overlay');
-    if (ov){ov.classList.remove('hidden');requestAnimationFrame(()=>ov.classList.add('show'));}
+        rndLat:hasGPS?userLat:null,rndLon:hasGPS?userLon:null,camLat:sLat,camLon:sLon,
+        camBearing:sBear,tgtBearing:hasGPS?(userHeading??sBear):sBear,gpsBearing:sBear,zoomNav:17.8,pitchMode:67});
+    const ov=$('nav-3d-overlay');if(ov){ov.classList.remove('hidden');requestAnimationFrame(()=>ov.classList.add('show'));}
     document.body.classList.add('nav-3d-mode');
-    const loaderEl=$('nav3d-loader');
-    if (loaderEl) loaderEl.classList.remove('hidden');
+    const loaderEl=$('nav3d-loader');if(loaderEl)loaderEl.classList.remove('hidden');
     _3dmStartDeviceOrientation();
-
     setTimeout(()=>{
-        if (!_3DM.active) return;
+        if(!_3DM.active)return;
         _3DM.map=new maplibregl.Map({
-            container:'nav-3d-map',
-            style:'https://tiles.openfreemap.org/styles/liberty',
+            container:'nav-3d-map',style:'https://tiles.openfreemap.org/styles/liberty',
             center:[sLon,sLat],zoom:_3DM.zoomNav,pitch:_3DM.pitchMode,bearing:sBear,
             antialias:true,attributionControl:false,logoPosition:'bottom-right',
-            maxBounds:INDIA_BOUNDS,minZoom:4,maxZoom:20,
-            maxTileCacheSize:200,
-            // ALLOW all gestures including two-finger rotation
-            dragRotate:true,
-            touchZoomRotate:true,
-            touchPitch:true,
-            keyboard:false,
+            maxBounds:INDIA_BOUNDS,minZoom:4,maxZoom:20.5,maxTileCacheSize:400,
+            dragRotate:true,touchZoomRotate:true,touchPitch:true,keyboard:false,renderWorldCopies:false,
+            fadeDuration:100,crossSourceCollisions:false,
         });
-
         _3DM.map.on('load',()=>{
-            if (!_3DM.active){try{_3DM.map?.remove();}catch(_){}return;}
-            try {
-                _3dmNightTheme(_3DM.map);
-                _3dmBuildings(_3DM.map);
+            if(!_3DM.active){try{_3DM.map?.remove();}catch(_){}return;}
+            try{
+                _3dmNightTheme(_3DM.map);_3dmBuildings(_3DM.map);
                 _3dmRouteLayer(_3DM.map,_3DM.routeCoords);
                 _3dmAddVehicle(_3DM.map,sLon,sLat,sBear,_3DM.vehicle);
                 _3dmUpdateAccRing(sLat,sLon,_3DM.curAcc);
-                _3DM.map.addControl(new maplibregl.ScaleControl({unit:'metric',maxWidth:100}),'bottom-right');
-                _3DM.styleReady=true;
-                if (loaderEl) loaderEl.classList.add('hidden');
-            } catch(e){console.error('[3D load]',e);}
+                _3DM.map.addControl(new maplibregl.ScaleControl({unit:'metric',maxWidth:90}),'bottom-right');
+                _3DM.styleReady=true;if(loaderEl)loaderEl.classList.add('hidden');
+            }catch(e){console.error('[3D load]',e);}
         });
-
-        _3DM.map.on('error',e=>{const m=e?.error?.message||String(e);if(!m.includes('404')&&!m.includes('cancel'))console.warn('[3D]',m);});
-
-        // Drag — kill position follow, keep heading follow
+        _3DM.map.on('error',e=>{const m=e?.error?.message||String(e);if(!m.includes('404')&&!m.includes('cancel')&&!m.includes('abort'))console.warn('[3D]',m);});
         _3DM.map.on('dragstart',()=>{_3DM.followMode=false;});
-
-        // Zoom — kill position follow
-        _3DM.map.on('zoomstart',e=>{
-            // pinch-zoom also fires rotatestart, so check if it's touch
-            _3DM.followMode=false;
-            _3DM.zoomNav=_3DM.map?.getZoom()??18;
-        });
+        _3DM.map.on('zoomstart',()=>{_3DM.followMode=false;_3DM.zoomNav=_3DM.map?.getZoom()??18;});
         _3DM.map.on('zoomend',()=>{_3DM.zoomNav=_3DM.map?.getZoom()??18;});
-
-        // Rotation — kill heading follow; position follow can stay
-        _3DM.map.on('rotatestart',()=>{
-            _3DM.userRotating=true;
-            _3DM.followHeading=false;  // user is manually rotating — let them
-        });
-        _3DM.map.on('rotateend',()=>{
-            _3DM.userRotating=false;
-            // Capture the bearing user set
-            _3DM.camBearing=(_3DM.map?.getBearing()??0);
-            _3DM.tgtBearing=_3DM.camBearing;
-        });
-
-        // Pitch
+        _3DM.map.on('rotatestart',()=>{_3DM.userRotating=true;_3DM.followHeading=false;});
+        _3DM.map.on('rotateend',()=>{_3DM.userRotating=false;_3DM.camBearing=(_3DM.map?.getBearing()??0);_3DM.tgtBearing=_3DM.camBearing;});
         _3DM.map.on('pitchend',()=>{_3DM.pitchMode=Math.round(_3DM.map.getPitch());});
-
         _3DM.rafId=requestAnimationFrame(_3dmLoop);
         window._3dmRzFn=()=>{try{_3DM.map?.resize();}catch(_){}};
         window.addEventListener('resize',window._3dmRzFn);
     },80);
 }
 
-/* ── Close 3D view ───────────────────────────────────────────── */
-function close3DView() {
+/* ── Close 3D ───────────────────────────────────────────── */
+function close3DView(){
     _3DM.active=false;_3DM.styleReady=false;
-    if (_3DM.rafId){cancelAnimationFrame(_3DM.rafId);_3DM.rafId=null;}
+    if(_3DM.rafId){cancelAnimationFrame(_3DM.rafId);_3DM.rafId=null;}
     _3dmStopDeviceOrientation();
-    if (window._3dmRzFn){window.removeEventListener('resize',window._3dmRzFn);window._3dmRzFn=null;}
-    try{_3DM.vehicleMarker?.remove();}catch(_){} _3DM.vehicleMarker=null;
-    try{_3DM.map?.remove();}catch(_){} _3DM.map=null;
+    if(window._3dmRzFn){window.removeEventListener('resize',window._3dmRzFn);window._3dmRzFn=null;}
+    try{_3DM.vehicleMarker?.remove();}catch(_){}_3DM.vehicleMarker=null;
+    try{_3DM.map?.remove();}catch(_){}_3DM.map=null;
     _3DM.rndLat=null;_3DM.rndLon=null;_3DM.curLat=null;_3DM.curLon=null;
-    const ov=$('nav-3d-overlay');
-    if (ov){ov.classList.remove('show');setTimeout(()=>ov.classList.add('hidden'),380);}
+    const ov=$('nav-3d-overlay');if(ov){ov.classList.remove('show');setTimeout(()=>ov.classList.add('hidden'),380);}
     document.body.classList.remove('nav-3d-mode');
 }
 
-/* ── Recenter sync ───────────────────────────────────────────── */
-function _3dmSyncRecenter() {
-    const btn=$('nav3d-recenter');
-    if (btn) btn.classList.toggle('active',!_3DM.followMode||!_3DM.followHeading);
-}
+function _3dmSyncRecenter(){const btn=$('nav3d-recenter');if(btn)btn.classList.toggle('active',!_3DM.followMode||!_3DM.followHeading);}
 
-/* ── Wire controls ───────────────────────────────────────────── */
-(function _setup3DControls() {
+/* ── Controls ───────────────────────────────────────────── */
+(function _setup3DControls(){
     const nav3dBtn=$('nav-3d-btn');
-    if (nav3dBtn) nav3dBtn.addEventListener('click',()=>{
-        if (_3DM.active){close3DView();nav3dBtn.classList.remove('is-active');}
-        else {
-            if (!_navActive&&routeGrps.length===0){showError('Search a route first.',4000);return;}
-            open3DView(_navActive?_navRouteIdx:0); nav3dBtn.classList.add('is-active');
-        }
+    if(nav3dBtn)nav3dBtn.addEventListener('click',()=>{
+        if(_3DM.active){close3DView();nav3dBtn.classList.remove('is-active');}
+        else{if(!_navActive&&routeGrps.length===0){showError('Search a route first.',4000);return;}open3DView(_navActive?_navRouteIdx:0);nav3dBtn.classList.add('is-active');}
     });
-
-    const exitBtn=$('nav-3d-exit');
-    if (exitBtn) exitBtn.addEventListener('click',()=>{close3DView();if(nav3dBtn)nav3dBtn.classList.remove('is-active');});
-
-    // Re-center: restore both position + heading follow
-    const rcBtn=$('nav3d-recenter');
-    if (rcBtn) rcBtn.addEventListener('click',()=>{
-        _3DM.followMode=true; _3DM.followHeading=true; _3DM.userRotating=false;
-        // Snap camera back to vehicle
-        if (_3DM.map&&_3DM.styleReady&&_3DM.rndLat!==null) {
-            _3DM.camBearing=_3DM.tgtBearing;
-            _3DM.map.easeTo({center:[_3DM.rndLon,_3DM.rndLat],bearing:_3DM.tgtBearing,
-                pitch:_3DM.pitchMode,zoom:_3DM.zoomNav,duration:600,easing:t=>1-Math.pow(1-t,3)});
-        }
+    const exitBtn=$('nav-3d-exit');if(exitBtn)exitBtn.addEventListener('click',()=>{close3DView();if(nav3dBtn)nav3dBtn.classList.remove('is-active');});
+    const rcBtn=$('nav3d-recenter');if(rcBtn)rcBtn.addEventListener('click',()=>{
+        _3DM.followMode=true;_3DM.followHeading=true;_3DM.userRotating=false;
+        if(_3DM.map&&_3DM.styleReady&&_3DM.rndLat!==null)_3DM.map.easeTo({center:[_3DM.rndLon,_3DM.rndLat],bearing:_3DM.tgtBearing,pitch:_3DM.pitchMode,zoom:_3DM.zoomNav,duration:650,easing:t=>1-Math.pow(1-t,3)});
     });
-
-    // Tilt
-    const tiltBtn=$('nav3d-tilt');
-    if (tiltBtn) tiltBtn.addEventListener('click',()=>{
-        _3DM.pitchMode=_3DM.pitchMode>10?0:63;
-        tiltBtn.classList.toggle('is-active',_3DM.pitchMode<10);
-        if (_3DM.map&&_3DM.styleReady) _3DM.map.easeTo({pitch:_3DM.pitchMode,duration:700,easing:t=>1-Math.pow(1-t,3)});
+    const tiltBtn=$('nav3d-tilt');if(tiltBtn)tiltBtn.addEventListener('click',()=>{
+        _3DM.pitchMode=_3DM.pitchMode>10?0:63;tiltBtn.classList.toggle('is-active',_3DM.pitchMode<10);
+        if(_3DM.map&&_3DM.styleReady)_3DM.map.easeTo({pitch:_3DM.pitchMode,duration:700,easing:t=>1-Math.pow(1-t,3)});
     });
-
-    // Heading lock toggle
-    const hBtn=$('nav3d-heading-lock');
-    if (hBtn) hBtn.addEventListener('click',()=>{
-        _3DM.followHeading=!_3DM.followHeading;
-        hBtn.classList.toggle('is-active',_3DM.followHeading);
-        if (_3DM.followHeading&&_3DM.map&&_3DM.styleReady) {
-            _3DM.camBearing=_3DM.tgtBearing;
-            _3DM.map.easeTo({bearing:_3DM.tgtBearing,duration:500,easing:t=>1-Math.pow(1-t,3)});
-        }
+    const hBtn=$('nav3d-heading-lock');if(hBtn)hBtn.addEventListener('click',()=>{
+        _3DM.followHeading=!_3DM.followHeading;hBtn.classList.toggle('is-active',_3DM.followHeading);
+        if(_3DM.followHeading&&_3DM.map&&_3DM.styleReady)_3DM.map.easeTo({bearing:_3DM.tgtBearing,duration:500,easing:t=>1-Math.pow(1-t,3)});
     });
-
-    // Vehicle chips
     document.querySelectorAll('.vehicle-chip').forEach(chip=>{
         chip.addEventListener('click',()=>{
             const v=chip.dataset.vehicle;if(!v)return;
             _3DM.vehicle=v;
-            document.querySelectorAll('.vehicle-chip').forEach(c=>{
-                c.classList.toggle('active',c.dataset.vehicle===v);
-                c.setAttribute('aria-pressed',String(c.dataset.vehicle===v));
-            });
-            if (_3DM.active&&_3DM.vehicleMarker&&_3DM.map){
-                const pos=_3DM.vehicleMarker.getLngLat(),rot=_3DM.tgtBearing;
-                try{_3DM.vehicleMarker.remove();}catch(_){} _3DM.vehicleMarker=null;
-                _3dmAddVehicle(_3DM.map,pos.lng,pos.lat,rot,v);
-            }
+            document.querySelectorAll('.vehicle-chip').forEach(c=>{c.classList.toggle('active',c.dataset.vehicle===v);c.setAttribute('aria-pressed',String(c.dataset.vehicle===v));});
+            if(_3DM.active&&_3DM.vehicleMarker&&_3DM.map){const pos=_3DM.vehicleMarker.getLngLat(),rot=_3DM.tgtBearing;try{_3DM.vehicleMarker.remove();}catch(_){}_3DM.vehicleMarker=null;_3dmAddVehicle(_3DM.map,pos.lng,pos.lat,rot,v);}
         });
     });
 })();
@@ -3968,670 +3930,757 @@ initGPS();
 
 'use strict'; // scoped via closure
 
+/* ================================================================
+   SMARTNAV UI v14 — Settings, Themes, Trip History, Bottom Nav
+================================================================ */
 (function SmartNavUI() {
 
-/* ── Trip storage (localStorage) ──────────────────────────── */
 const TRIPS_KEY = 'smartnav.trips.v2';
-const PREFS_KEY = 'smartnav.prefs.v1';
+const PREFS_KEY = 'smartnav.prefs.v2';
 
-function _loadTrips() {
-    try { return JSON.parse(localStorage.getItem(TRIPS_KEY) || '[]'); } catch(_) { return []; }
-}
+/* ── Prefs helpers ──────────────────────────────────────── */
+function _loadPrefs() { try { return JSON.parse(localStorage.getItem(PREFS_KEY)||'{}'); } catch(_){return{};} }
+function _savePrefs(p){ try { localStorage.setItem(PREFS_KEY,JSON.stringify(p)); } catch(_){} }
+function _loadTrips()  { try { return JSON.parse(localStorage.getItem(TRIPS_KEY)||'[]'); } catch(_){return[];} }
+function _saveTrips(t) { try { localStorage.setItem(TRIPS_KEY,JSON.stringify(t.slice(0,150))); } catch(_){} }
 
-function _saveTrips(trips) {
-    try { localStorage.setItem(TRIPS_KEY, JSON.stringify(trips.slice(0,100))); } catch(_) {}
-}
+/* ── Theme engine ───────────────────────────────────────── */
+const THEMES = ['dark','amoled','midnight','light'];
 
-function _loadPrefs() {
-    try { return JSON.parse(localStorage.getItem(PREFS_KEY) || '{}'); } catch(_) { return {}; }
-}
-
-function _savePrefs(p) {
-    try { localStorage.setItem(PREFS_KEY, JSON.stringify(p)); } catch(_) {}
-}
-
-/* ── Save a completed/started trip ────────────────────────── */
-function _recordTrip(destText, distKm, durationMin, routeLabel) {
-    const trips = _loadTrips();
-    const now = Date.now();
-    const tags = _inferTripTags(destText, distKm);
-    trips.unshift({
-        id: now,
-        dest: destText || 'Unknown',
-        distKm: Math.round(distKm * 10) / 10,
-        durMin: Math.round(durationMin),
-        ts: now,
-        tags,
-        routeLabel: routeLabel || 'Best Route',
+function _applyTheme(name) {
+    const t = THEMES.includes(name) ? name : 'dark';
+    document.body.className = document.body.className
+        .split(' ')
+        .filter(c => !c.startsWith('theme-'))
+        .join(' ') + ` theme-${t}`;
+    // Update meta theme-color
+    const meta = document.getElementById('meta-theme-color');
+    const colors = {dark:'#060b13',amoled:'#000000',midnight:'#03060e',light:'#f0f4f8'};
+    if (meta) meta.content = colors[t] || '#060b13';
+    // Update theme picker UI
+    document.querySelectorAll('.theme-chip').forEach(c => {
+        const active = c.dataset.theme === t;
+        c.classList.toggle('active', active);
+        c.setAttribute('aria-checked', String(active));
     });
-    _saveTrips(trips);
-    _renderProfileStats();
-    _renderRecentTrips();
+    // Persist
+    const p = _loadPrefs(); p.theme = t; _savePrefs(p);
 }
 
-function _inferTripTags(dest, km) {
-    const d = (dest||'').toLowerCase();
-    const tags = [];
-    if (/office|work|tech|hub|corporate|it park|business/.test(d)) tags.push('work');
-    else if (/beach|park|garden|mall|cinema|hotel|resort|lake|hill/.test(d)) tags.push('leisure');
-    else if (/airport|railway|station|bus stand|terminal/.test(d)) tags.push('travel');
-    if (km < 10 && km > 0) tags.push('eco');
+function _initThemePicker() {
+    document.querySelectorAll('.theme-chip').forEach(btn => {
+        btn.addEventListener('click', () => _applyTheme(btn.dataset.theme));
+    });
+}
+
+/* ── Trip recording ─────────────────────────────────────── */
+function _recordTrip(dest, distKm, durMin, label) {
+    const trips = _loadTrips();
+    const tags = _inferTags(dest, distKm);
+    trips.unshift({ id:Date.now(), dest:dest||'Unknown',
+        distKm:Math.round(distKm*10)/10, durMin:Math.round(durMin),
+        ts:Date.now(), tags, routeLabel:label||'' });
+    _saveTrips(trips);
+    _renderProfileStats(); _renderRecentTrips();
+}
+
+function _inferTags(dest, km) {
+    const d=(dest||'').toLowerCase(), tags=[];
+    if(/office|work|tech|hub|corporate|it park|business/.test(d)) tags.push('work');
+    else if(/beach|park|garden|mall|cinema|hotel|resort|lake|hill/.test(d)) tags.push('leisure');
+    else if(/airport|railway|station|bus stand|terminal/.test(d)) tags.push('travel');
+    if(km<10&&km>0) tags.push('eco');
     return tags;
 }
 
-/* ── Stats calculation ─────────────────────────────────────── */
 function _calcStats(trips) {
-    const totalKm = trips.reduce((s, t) => s + (t.distKm||0), 0);
-    const totalHrs = Math.round(trips.reduce((s, t) => s + (t.durMin||0), 0) / 60 * 10) / 10;
-    const aiScore = trips.length > 0 ? Math.min(99, 70 + Math.floor(trips.length * 1.8)) : 0;
-    return { totalKm: Math.round(totalKm * 10)/10, trips: trips.length, totalHrs, aiScore };
+    const totalKm = Math.round(trips.reduce((s,t)=>s+(t.distKm||0),0)*10)/10;
+    const totalHrs= Math.round(trips.reduce((s,t)=>s+(t.durMin||0),0)/60*10)/10;
+    const ai = trips.length>0?Math.min(99,70+Math.floor(trips.length*1.8)):0;
+    return {totalKm, trips:trips.length, totalHrs, ai};
 }
 
-/* ── Render profile stats ──────────────────────────────────── */
+/* ── Render stats ───────────────────────────────────────── */
 function _renderProfileStats() {
-    const trips = _loadTrips();
-    const s = _calcStats(trips);
-    const statDist = document.getElementById('stat-distance');
-    const statTrips = document.getElementById('stat-trips');
-    const statHours = document.getElementById('stat-hours');
-    const statAI = document.getElementById('stat-ai');
-    const actKm = document.getElementById('act-total-km');
-    const actTrips = document.getElementById('act-total-trips');
-    const actHrs = document.getElementById('act-total-hrs');
-    if (statDist)  statDist.innerHTML  = `${s.totalKm} <span class="stat-unit">km</span>`;
-    if (statTrips) statTrips.textContent = s.trips;
-    if (statHours) statHours.innerHTML = `${s.totalHrs} <span class="stat-unit">h</span>`;
-    if (statAI)    statAI.textContent  = `${s.aiScore}%`;
-    if (actKm)     actKm.textContent   = s.totalKm;
-    if (actTrips)  actTrips.textContent = s.trips;
-    if (actHrs)    actHrs.textContent  = s.totalHrs;
+    const s = _calcStats(_loadTrips());
+    const set = (id,v)=>{const el=document.getElementById(id);if(el)el.textContent=v;};
+    set('stat-trips',   s.trips);
+    set('act-total-km', s.totalKm);
+    set('act-total-trips', s.trips);
+    set('act-total-hrs', s.totalHrs);
+    const sd=document.getElementById('stat-distance');
+    if(sd) sd.innerHTML=`${s.totalKm} <span class="stat-unit">km</span>`;
+    const sh=document.getElementById('stat-hours');
+    if(sh) sh.innerHTML=`${s.totalHrs} <span class="stat-unit">h</span>`;
+    const sa=document.getElementById('stat-ai');
+    if(sa) sa.textContent=`${s.ai}%`;
 }
 
-/* ── Trip card HTML ────────────────────────────────────────── */
-function _tripCardHTML(trip) {
-    const d = new Date(trip.ts);
-    const dateStr = d.toLocaleDateString('en-IN', { month:'short', day:'numeric' });
-    const tagsHTML = (trip.tags||[]).map(t => {
-        const cls = `trip-tag trip-tag-${t}`;
-        const label = t.charAt(0).toUpperCase() + t.slice(1);
-        return `<span class="${cls}">${label}</span>`;
-    }).join('');
-    const emoji = _destEmoji(trip.dest);
-    return `
-<div class="trip-card" role="listitem" tabindex="0" data-dest="${_esc(trip.dest)}" data-lat="" data-lon="">
-    <div class="trip-map-thumb">${emoji}</div>
+/* ── Animated counter ───────────────────────────────────── */
+function _animNum(el,target,dur=700){
+    if(!el)return;
+    const start=parseFloat(el.textContent)||0;
+    if(Math.abs(start-target)<0.01){el.textContent=target;return;}
+    const t0=performance.now();
+    const step=ts=>{
+        const p=Math.min(1,(ts-t0)/dur),e=1-Math.pow(1-p,3);
+        const v=start+(target-start)*e;
+        el.textContent=Number.isInteger(target)?Math.round(v):v.toFixed(1);
+        if(p<1)requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+}
+
+/* ── Trip card HTML ─────────────────────────────────────── */
+function _esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+function _destEmoji(dest){
+    const d=(dest||'').toLowerCase();
+    if(/airport|terminal|fly/.test(d))return'✈️';
+    if(/railway|station|metro|bus/.test(d))return'🚉';
+    if(/hospital|medical|clinic/.test(d))return'🏥';
+    if(/beach|lake|park|garden/.test(d))return'🌊';
+    if(/mall|market|bazaar|shop/.test(d))return'🛒';
+    if(/hotel|resort|inn/.test(d))return'🏨';
+    if(/restaurant|food|dhaba|café|coffee/.test(d))return'🍽️';
+    if(/office|corporate|tech|it park/.test(d))return'🏢';
+    if(/temple|mandir|mosque|church|gurudwara/.test(d))return'🛕';
+    return'📍';
+}
+
+function _tripCardHTML(trip){
+    const d=new Date(trip.ts);
+    const dateStr=d.toLocaleDateString('en-IN',{month:'short',day:'numeric'});
+    const tags=(trip.tags||[]).map(t=>`<span class="trip-tag trip-tag-${_esc(t)}">${_esc(t.charAt(0).toUpperCase()+t.slice(1))}</span>`).join('');
+    const prefs=_loadPrefs();
+    const distLabel=prefs.units==='mi'?`${(trip.distKm*0.621371).toFixed(1)} mi`:`${trip.distKm} km`;
+    return `<div class="trip-card" role="listitem" tabindex="0" data-dest="${_esc(trip.dest)}">
+    <div class="trip-map-thumb">${_destEmoji(trip.dest)}</div>
     <div class="trip-info">
         <div class="trip-dest">${_esc(trip.dest)}</div>
-        <div class="trip-meta">${dateStr} • ${trip.distKm} km • ${trip.durMin} min</div>
-        <div class="trip-tags">${tagsHTML}</div>
+        <div class="trip-meta">${dateStr} • ${distLabel} • ${trip.durMin} min</div>
+        <div class="trip-tags">${tags}</div>
     </div>
     <svg class="trip-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
 </div>`;
 }
 
-function _destEmoji(dest) {
-    const d = (dest||'').toLowerCase();
-    if (/airport|terminal|fly/.test(d)) return '✈️';
-    if (/railway|station|metro|bus/.test(d)) return '🚉';
-    if (/hospital|medical|clinic|doctor/.test(d)) return '🏥';
-    if (/beach|lake|park|garden/.test(d)) return '🌊';
-    if (/mall|market|bazaar|shop/.test(d)) return '🛒';
-    if (/hotel|resort|inn/.test(d)) return '🏨';
-    if (/restaurant|food|dhaba|café|coffee/.test(d)) return '🍽️';
-    if (/office|corporate|tech|it park/.test(d)) return '🏢';
-    if (/temple|mandir|mosque|church|gurudwara/.test(d)) return '🛕';
-    return '📍';
+function _bindTripClicks(container){
+    container.querySelectorAll('.trip-card').forEach(card=>{
+        const go=()=>{
+            _openPage(null);
+            const inp=document.getElementById('dest-input');
+            if(inp) inp.value=card.dataset.dest||'';
+            const form=document.getElementById('search-form');
+            if(form) form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
+        };
+        card.addEventListener('click',go);
+        card.addEventListener('keydown',e=>{if(e.key==='Enter')go();});
+    });
 }
 
-function _esc(s) {
-    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
+function _renderRecentTrips(filter){
+    let trips=_loadTrips();
+    if(filter&&filter!=='all') trips=trips.filter(t=>(t.tags||[]).includes(filter));
+    const recent3=_loadTrips().slice(0,3);
 
-/* ── Render recent trips ────────────────────────────────────── */
-function _renderRecentTrips(filter) {
-    let trips = _loadTrips();
-    if (filter && filter !== 'all') trips = trips.filter(t => (t.tags||[]).includes(filter));
-
-    // Recent (profile page — max 3)
-    const recentList = document.getElementById('recent-trips-list');
-    const emptyEl = document.getElementById('trips-empty');
-    if (recentList) {
-        const recent3 = _loadTrips().slice(0,3);
-        if (recent3.length === 0) {
-            recentList.innerHTML = '<div class="trips-empty" id="trips-empty"><svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="rgba(79,158,255,.3)" stroke-width="1.5"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z"/><circle cx="12" cy="10" r="3"/></svg><p>No trips yet. Start navigating!</p></div>';
-        } else {
-            recentList.innerHTML = recent3.map(_tripCardHTML).join('');
-            _bindTripClicks(recentList);
-        }
+    const rList=document.getElementById('recent-trips-list');
+    if(rList){
+        if(!recent3.length){rList.innerHTML='<div class="trips-empty"><svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="rgba(79,158,255,.3)" stroke-width="1.5"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z"/><circle cx="12" cy="10" r="3"/></svg><p>No trips yet. Start navigating!</p></div>';}
+        else{rList.innerHTML=recent3.map(_tripCardHTML).join('');_bindTripClicks(rList);}
     }
-
-    // Activity page — all
-    const actList = document.getElementById('activity-list');
-    if (actList) {
-        if (trips.length === 0) {
-            actList.innerHTML = '<div class="trips-empty"><svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="rgba(79,158,255,.3)" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><p>No activity yet.</p></div>';
-        } else {
-            actList.innerHTML = trips.map(_tripCardHTML).join('');
-            _bindTripClicks(actList);
-        }
+    const aList=document.getElementById('activity-list');
+    if(aList){
+        if(!trips.length){aList.innerHTML='<div class="trips-empty"><svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="rgba(79,158,255,.3)" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><p>No activity yet.</p></div>';}
+        else{aList.innerHTML=trips.map(_tripCardHTML).join('');_bindTripClicks(aList);}
     }
-
-    // Recent places (navigate page)
     _renderRecentPlaces();
 }
 
-function _bindTripClicks(container) {
-    container.querySelectorAll('.trip-card').forEach(card => {
-        card.addEventListener('click', () => {
-            const dest = card.dataset.dest;
-            if (!dest) return;
-            _openPage(null); // close all pages
-            const input = document.getElementById('dest-input');
-            if (input) { input.value = dest; }
-            // Trigger search
-            const form = document.getElementById('search-form');
-            if (form) form.dispatchEvent(new Event('submit', {bubbles:true,cancelable:true}));
-        });
-    });
-}
-
-/* ── Recent places in navigate page ───────────────────────── */
-function _renderRecentPlaces() {
-    const trips = _loadTrips().slice(0,6);
-    const list = document.getElementById('recent-places-list');
-    if (!list) return;
-    if (trips.length === 0) {
-        list.innerHTML = '<div style="padding:10px 0;color:var(--muted);font-size:.78rem">No recent places yet.</div>';
-        return;
-    }
-    const seen = new Set();
-    const uniq = trips.filter(t => {
-        if (seen.has(t.dest)) return false;
-        seen.add(t.dest);
-        return true;
-    }).slice(0,5);
-    list.innerHTML = uniq.map(t => `
-<div class="recent-place-item" role="listitem" tabindex="0" data-dest="${_esc(t.dest)}">
+function _renderRecentPlaces(){
+    const trips=_loadTrips().slice(0,8);
+    const list=document.getElementById('recent-places-list');
+    if(!list)return;
+    if(!trips.length){list.innerHTML='<div style="padding:10px 0;color:var(--muted);font-size:.78rem">No recent places yet.</div>';return;}
+    const seen=new Set();
+    const uniq=trips.filter(t=>{if(seen.has(t.dest))return false;seen.add(t.dest);return true;}).slice(0,6);
+    list.innerHTML=uniq.map(t=>`<div class="recent-place-item" role="listitem" tabindex="0" data-dest="${_esc(t.dest)}">
     <div class="recent-place-icon">${_destEmoji(t.dest)}</div>
-    <div class="recent-place-info">
-        <div class="recent-place-name">${_esc(t.dest)}</div>
-        <div class="recent-place-sub">${t.distKm} km • ${new Date(t.ts).toLocaleDateString('en-IN',{month:'short',day:'numeric'})}</div>
-    </div>
+    <div class="recent-place-info"><div class="recent-place-name">${_esc(t.dest)}</div>
+    <div class="recent-place-sub">${t.distKm}km • ${new Date(t.ts).toLocaleDateString('en-IN',{month:'short',day:'numeric'})}</div></div>
 </div>`).join('');
+    list.querySelectorAll('.recent-place-item').forEach(item=>{
+        const go=()=>{_openPage(null);const inp=document.getElementById('dest-input');if(inp)inp.value=item.dataset.dest||'';const form=document.getElementById('search-form');if(form)form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));};
+        item.addEventListener('click',go);item.addEventListener('keydown',e=>{if(e.key==='Enter')go();});
+    });
+}
 
-    list.querySelectorAll('.recent-place-item').forEach(item => {
-        item.addEventListener('click', () => {
-            const dest = item.dataset.dest;
-            _openPage(null);
-            const input = document.getElementById('dest-input');
-            if (input) { input.value = dest; }
-            const form = document.getElementById('search-form');
-            if (form) form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
+/* ── Settings page logic ────────────────────────────────── */
+function _initSettings(){
+    const prefs=_loadPrefs();
+
+    // Load saved values
+    document.querySelectorAll('[data-pref]').forEach(btn=>{
+        const key=btn.dataset.pref;
+        const val=btn.dataset.val;
+        if(prefs[key]===val){btn.classList.add('active');}
+        btn.addEventListener('click',()=>{
+            document.querySelectorAll(`[data-pref="${key}"]`).forEach(b=>b.classList.remove('active'));
+            btn.classList.add('active');
+            const p=_loadPrefs();p[key]=val;_savePrefs(p);
+            _onPrefChange(key,val);
         });
     });
+
+    // Checkboxes
+    const swMap={
+        'sw-speed-alerts':'speedAlerts','sw-auto-reroute':'autoReroute',
+        'sw-wakelock':'wakelock','sw-traffic':'showTraffic',
+        'sw-3d-buildings':'show3dBuildings','sw-kalman':'kalmanSmoothing',
+        'sw-acc-ring':'showAccRing',
+    };
+    Object.entries(swMap).forEach(([id,key])=>{
+        const el=document.getElementById(id);
+        if(!el)return;
+        if(prefs[key]===false) el.checked=false;
+        el.addEventListener('change',()=>{const p=_loadPrefs();p[key]=el.checked;_savePrefs(p);_onPrefChange(key,el.checked);});
+    });
+
+    // Waklock management
+    let _wakeLock=null;
+    async function _requestWakeLock(){
+        try{if('wakeLock' in navigator&&prefs.wakelock!==false){_wakeLock=await navigator.wakeLock.request('screen');}}catch(_){}
+    }
+    async function _releaseWakeLock(){if(_wakeLock){try{await _wakeLock.release();}catch(_){}_wakeLock=null;}}
+    document.getElementById('sw-wakelock')?.addEventListener('change',e=>{e.target.checked?_requestWakeLock():_releaseWakeLock();});
+    if(prefs.wakelock!==false) _requestWakeLock();
+
+    // GPS diagnostics button
+    const gpsDiag=document.getElementById('gps-diag-btn');
+    if(gpsDiag){
+        let panel=null;
+        gpsDiag.addEventListener('click',()=>{
+            if(!panel){
+                panel=document.createElement('div');
+                panel.className='gps-diag-panel';
+                gpsDiag.parentElement.appendChild(panel);
+            }
+            const show=!panel.classList.contains('show');
+            panel.classList.toggle('show',show);
+            if(show) _updateGpsDiag(panel);
+        });
+    }
+
+    // Edit profile name
+    const editProfileBtn=document.getElementById('edit-profile-btn');
+    if(editProfileBtn) editProfileBtn.addEventListener('click',()=>{
+        _showModal('Enter your name','Your Name',(val)=>{
+            if(!val.trim())return;
+            const p=_loadPrefs();p.name=val.trim();_savePrefs(p);
+            const el=document.getElementById('profile-name');if(el)el.textContent=val.trim();
+            const disp=document.getElementById('profile-name-display');if(disp)disp.textContent=val.trim();
+        },_loadPrefs().name||'');
+    });
+
+    // Set home
+    const homeBtn=document.getElementById('set-home-btn');
+    if(homeBtn) homeBtn.addEventListener('click',()=>{
+        _showModal('Set Home Location','e.g. My House, Pune',(val)=>{
+            if(!val.trim())return;
+            const p=_loadPrefs();p.home=val.trim();_savePrefs(p);
+            const sub=document.getElementById('home-label-sub');if(sub)sub.textContent=val.trim();
+        },_loadPrefs().home||'');
+    });
+
+    // Set work
+    const workBtn=document.getElementById('set-work-btn');
+    if(workBtn) workBtn.addEventListener('click',()=>{
+        _showModal('Set Work Location','e.g. Office, Whitefield Bangalore',(val)=>{
+            if(!val.trim())return;
+            const p=_loadPrefs();p.work=val.trim();_savePrefs(p);
+            const sub=document.getElementById('work-label-sub');if(sub)sub.textContent=val.trim();
+        },_loadPrefs().work||'');
+    });
+
+    // Clear data
+    const clearDataBtn=document.getElementById('clear-data-btn');
+    if(clearDataBtn) clearDataBtn.addEventListener('click',()=>{
+        if(confirm('Clear all trip history? This cannot be undone.')){
+            _saveTrips([]);_renderProfileStats();_renderRecentTrips();
+        }
+    });
+    const clearPrefsBtn=document.getElementById('clear-prefs-btn');
+    if(clearPrefsBtn) clearPrefsBtn.addEventListener('click',()=>{
+        if(confirm('Reset all settings to defaults?')){
+            localStorage.removeItem(PREFS_KEY);
+            _applyTheme('dark');
+            setTimeout(()=>window.location.reload(),200);
+        }
+    });
+
+    // Load label values
+    const p=_loadPrefs();
+    const profNameDisp=document.getElementById('profile-name-display');if(profNameDisp&&p.name)profNameDisp.textContent=p.name;
+    const homeDisp=document.getElementById('home-label-sub');if(homeDisp&&p.home)homeDisp.textContent=p.home;
+    const workDisp=document.getElementById('work-label-sub');if(workDisp&&p.work)workDisp.textContent=p.work;
 }
 
-/* ── Page navigation ────────────────────────────────────────── */
-let _currentPage = null;
+function _updateGpsDiag(panel){
+    if(typeof userLat==='undefined'||typeof _lastFixAccuracy==='undefined'){panel.innerHTML='GPS module not ready.';return;}
+    const lines=[
+        `Status: <span>${typeof _gpsUsingFallback!=='undefined'&&_gpsUsingFallback?'Fallback':'Live GPS'}</span>`,
+        `Lat: <span>${userLat!==null?userLat.toFixed(6):'—'}</span>`,
+        `Lon: <span>${userLon!==null?userLon.toFixed(6):'—'}</span>`,
+        `Accuracy: <span>${_lastFixAccuracy?Math.round(_lastFixAccuracy)+'m':'—'}</span>`,
+        `Speed: <span>${typeof userSpeedKmh!=='undefined'?Math.round(userSpeedKmh)+' km/h':'—'}</span>`,
+        `Heading: <span>${typeof userHeading!=='undefined'&&userHeading!==null?Math.round(userHeading)+'°':'—'}</span>`,
+        `GPS Watch: <span>${typeof _gpsWatching!=='undefined'&&_gpsWatching?'Active':'Inactive'}</span>`,
+    ];
+    panel.innerHTML=lines.join('<br>');
+    setTimeout(()=>{if(panel.classList.contains('show'))_updateGpsDiag(panel);},1500);
+}
 
-function _openPage(pageId) {
-    // Close all panels
-    ['profile','activity','navigate'].forEach(id => {
-        const el = document.getElementById(`page-${id}`);
-        if (el) { el.classList.remove('visible'); el.classList.add('hidden'); }
+function _onPrefChange(key, val){
+    if(key==='units') _renderRecentTrips();
+    if(key==='mapStyle'){
+        const meta=document.getElementById('map-style-meta');
+        if(meta) meta.textContent=val.charAt(0).toUpperCase()+val.slice(1)+' style';
+        const sub=document.getElementById('map-style-label-sub');
+        if(sub) sub.textContent=val.charAt(0).toUpperCase()+val.slice(1);
+        // Apply map style change
+        document.querySelectorAll('.map-style-chip').forEach(c=>c.classList.toggle('active',c.dataset.styleId===val));
+        const btn=document.querySelector(`.map-style-chip[data-style-id="${val}"]`);
+        if(btn) btn.click();
+    }
+    if(key==='gpsMode'){
+        const sub=document.getElementById('gps-mode-sub');
+        const labels={high:'High accuracy (battery intensive)',balanced:'Balanced mode',low:'Power saver mode'};
+        if(sub) sub.textContent=labels[val]||val;
+    }
+}
+
+/* ── Modal helper ───────────────────────────────────────── */
+function _showModal(title, placeholder, onOk, initialValue=''){
+    const overlay=document.getElementById('input-modal');
+    const titleEl=document.getElementById('modal-title');
+    const input=document.getElementById('modal-input');
+    const cancelBtn=document.getElementById('modal-cancel');
+    const okBtn=document.getElementById('modal-ok');
+    if(!overlay||!input)return;
+    if(titleEl) titleEl.textContent=title;
+    input.placeholder=placeholder;
+    input.value=initialValue;
+    overlay.classList.remove('hidden');
+    requestAnimationFrame(()=>{overlay.classList.add('visible');input.focus();input.select();});
+    const close=()=>{overlay.classList.remove('visible');setTimeout(()=>overlay.classList.add('hidden'),250);};
+    const ok=()=>{onOk(input.value);close();};
+    cancelBtn.onclick=close;
+    okBtn.onclick=ok;
+    input.onkeydown=e=>{if(e.key==='Enter')ok();if(e.key==='Escape')close();};
+    overlay.onclick=e=>{if(e.target===overlay)close();};
+}
+
+/* ── Page navigation ────────────────────────────────────── */
+let _currentPage=null;
+
+function _openPage(pageId){
+    const allPages=['profile','activity','navigate','settings'];
+    allPages.forEach(id=>{
+        const el=document.getElementById(`page-${id}`);
+        if(el){el.classList.remove('visible');el.classList.add('hidden');}
     });
-    // Close quick-add sheet
-    const qa = document.getElementById('quick-add-sheet');
-    if (qa) { qa.classList.remove('visible'); qa.classList.add('hidden'); }
-
-    _currentPage = pageId;
-
-    if (!pageId || pageId === 'explore') {
-        // Reset bottom nav to explore
-        _setActiveTab('explore');
+    const qa=document.getElementById('quick-add-sheet');
+    if(qa){qa.classList.remove('visible');qa.classList.add('hidden');}
+    _currentPage=pageId;
+    if(!pageId||pageId==='explore'){_setActiveTab('explore');return;}
+    if(pageId==='quick-add'){
+        const sheet=document.getElementById('quick-add-sheet');
+        if(sheet){sheet.classList.remove('hidden');requestAnimationFrame(()=>sheet.classList.add('visible'));}
         return;
     }
-
-    if (pageId === 'quick-add') {
-        const sheet = document.getElementById('quick-add-sheet');
-        if (sheet) { sheet.classList.remove('hidden'); requestAnimationFrame(() => sheet.classList.add('visible')); }
-        return;
-    }
-
-    const panel = document.getElementById(`page-${pageId}`);
-    if (!panel) return;
+    const panel=document.getElementById(`page-${pageId}`);
+    if(!panel)return;
     panel.classList.remove('hidden');
-    requestAnimationFrame(() => panel.classList.add('visible'));
-
-    // Refresh data when opening
-    if (pageId === 'profile' || pageId === 'activity') {
-        _renderProfileStats();
-        _renderRecentTrips();
-    }
-    if (pageId === 'navigate') {
-        _renderRecentPlaces();
-        setTimeout(() => {
-            const inp = document.getElementById('nav-page-dest');
-            if (inp) inp.focus();
-        }, 350);
-    }
+    requestAnimationFrame(()=>panel.classList.add('visible'));
+    if(pageId==='profile'||pageId==='activity'){_renderProfileStats();_renderRecentTrips();}
+    if(pageId==='navigate'){_renderRecentPlaces();setTimeout(()=>{const inp=document.getElementById('nav-page-dest');if(inp)inp.focus();},350);}
+    if(pageId==='settings'){_refreshSettingsUI();}
 }
 
-function _setActiveTab(tab) {
-    document.querySelectorAll('.bnav-item').forEach(btn => {
-        btn.classList.toggle('active', btn.dataset.page === tab);
+function _refreshSettingsUI(){
+    const p=_loadPrefs();
+    // Sync checkboxes
+    const swMap={'sw-speed-alerts':'speedAlerts','sw-auto-reroute':'autoReroute','sw-wakelock':'wakelock','sw-traffic':'showTraffic','sw-3d-buildings':'show3dBuildings','sw-kalman':'kalmanSmoothing','sw-acc-ring':'showAccRing'};
+    Object.entries(swMap).forEach(([id,key])=>{const el=document.getElementById(id);if(el)el.checked=p[key]!==false;});
+    // Sync toggle groups
+    document.querySelectorAll('[data-pref]').forEach(btn=>{
+        const key=btn.dataset.pref,val=btn.dataset.val;
+        const active=p[key]?p[key]===val:(btn.classList.contains('active'));
+        btn.classList.toggle('active',active);
     });
 }
 
-/* ── Bottom nav wiring ─────────────────────────────────────── */
-function _initBottomNav() {
-    document.querySelectorAll('.bnav-item').forEach(btn => {
-        btn.addEventListener('click', () => {
-            const page = btn.dataset.page;
-            _setActiveTab(page === 'explore' ? 'explore' : page);
+function _setActiveTab(tab){
+    document.querySelectorAll('.bnav-item').forEach(btn=>{
+        btn.classList.toggle('active',btn.dataset.page===tab);
+    });
+}
+
+/* ── Bottom nav init ────────────────────────────────────── */
+function _initBottomNav(){
+    document.querySelectorAll('.bnav-item').forEach(btn=>{
+        btn.addEventListener('click',()=>{
+            const page=btn.dataset.page;
+            _setActiveTab(page==='explore'?'explore':page);
             _openPage(page);
         });
     });
 
-    // Back / close buttons
-    document.querySelectorAll('[data-page-close]').forEach(btn => {
-        btn.addEventListener('click', () => {
-            _openPage(null);
-            _setActiveTab('explore');
-        });
+    document.querySelectorAll('[data-page-close]').forEach(btn=>{
+        btn.addEventListener('click',()=>{_openPage(null);_setActiveTab('explore');});
     });
 
-    // Quick-add backdrop
-    const qaBackdrop = document.getElementById('qa-backdrop');
-    if (qaBackdrop) qaBackdrop.addEventListener('click', () => {
-        _openPage(null); _setActiveTab('explore');
+    document.getElementById('qa-backdrop')?.addEventListener('click',()=>{_openPage(null);_setActiveTab('explore');});
+    document.getElementById('clear-history-btn')?.addEventListener('click',()=>{
+        if(confirm('Clear all trip history?')){_saveTrips([]);_renderProfileStats();_renderRecentTrips();}
     });
+    document.getElementById('view-all-trips-btn')?.addEventListener('click',()=>{_openPage('activity');_setActiveTab('activity');});
 
-    // Clear history button
-    const clearHistBtn = document.getElementById('clear-history-btn');
-    if (clearHistBtn) clearHistBtn.addEventListener('click', () => {
-        if (confirm('Clear all trip history?')) {
-            _saveTrips([]);
-            _renderProfileStats();
-            _renderRecentTrips();
-        }
-    });
-
-    // View all trips → open activity
-    const viewAll = document.getElementById('view-all-trips-btn');
-    if (viewAll) viewAll.addEventListener('click', () => { _openPage('activity'); _setActiveTab('activity'); });
+    // Settings access from profile
+    document.getElementById('profile-settings-btn')?.addEventListener('click',()=>{_openPage('settings');});
+    document.getElementById('open-settings-from-profile')?.addEventListener('click',()=>{_openPage('settings');});
 
     // Activity filter tabs
-    document.querySelectorAll('.act-tab').forEach(tab => {
-        tab.addEventListener('click', () => {
-            document.querySelectorAll('.act-tab').forEach(t => t.classList.remove('active'));
-            tab.classList.add('active');
+    document.querySelectorAll('.act-tab').forEach(tab=>{
+        tab.addEventListener('click',()=>{
+            document.querySelectorAll('.act-tab').forEach(t=>{t.classList.remove('active');t.setAttribute('aria-selected','false');});
+            tab.classList.add('active');tab.setAttribute('aria-selected','true');
             _renderRecentTrips(tab.dataset.filter);
         });
     });
 
     // Profile vehicle selector
-    document.querySelectorAll('.pv-chip').forEach(chip => {
-        chip.addEventListener('click', () => {
-            document.querySelectorAll('.pv-chip').forEach(c => c.classList.remove('active'));
+    document.querySelectorAll('.pv-chip').forEach(chip=>{
+        chip.addEventListener('click',()=>{
+            document.querySelectorAll('.pv-chip').forEach(c=>c.classList.remove('active'));
             chip.classList.add('active');
-            const v = chip.dataset.vehicle;
-            const prefs = _loadPrefs();
-            prefs.vehicle = v;
-            _savePrefs(prefs);
-            // Sync with 3D vehicle chips
-            document.querySelectorAll('.vehicle-chip').forEach(c => {
-                c.classList.toggle('active', c.dataset.vehicle === v);
-                c.setAttribute('aria-pressed', String(c.dataset.vehicle === v));
-            });
-            if (typeof _3DM !== 'undefined') _3DM.vehicle = v;
+            const v=chip.dataset.vehicle;
+            const p=_loadPrefs();p.vehicle=v;_savePrefs(p);
+            document.querySelectorAll('.vehicle-chip').forEach(c=>{c.classList.toggle('active',c.dataset.vehicle===v);c.setAttribute('aria-pressed',String(c.dataset.vehicle===v));});
+            if(typeof _3DM!=='undefined') _3DM.vehicle=v;
         });
     });
 
-    // Navigate page search
-    const navPageDest = document.getElementById('nav-page-dest');
-    const navPageGo   = document.getElementById('nav-page-go-btn');
-    const navPageSugg = document.getElementById('nav-page-suggestions');
-
-    if (navPageDest) {
-        let _npTimer = null;
-        navPageDest.addEventListener('input', () => {
-            const q = navPageDest.value.trim();
-            if (!q || q.length < 2) { if (navPageSugg) navPageSugg.classList.add('hidden'); return; }
-            clearTimeout(_npTimer);
-            _npTimer = setTimeout(() => _fetchNavPageSuggestions(q), 280);
+    // Navigate page
+    const navPageDest=document.getElementById('nav-page-dest');
+    const navPageGo=document.getElementById('nav-page-go-btn');
+    const navPageSugg=document.getElementById('nav-page-suggestions');
+    if(navPageDest){
+        let _npTimer=null;
+        navPageDest.addEventListener('input',()=>{
+            const q=navPageDest.value.trim();
+            if(!q||q.length<2){if(navPageSugg)navPageSugg.classList.add('hidden');return;}
+            clearTimeout(_npTimer);_npTimer=setTimeout(()=>_fetchNavPageSugg(q),280);
         });
-        navPageDest.addEventListener('keydown', e => {
-            if (e.key === 'Enter') { e.preventDefault(); _doNavPageSearch(); }
-        });
+        navPageDest.addEventListener('blur',()=>setTimeout(()=>navPageSugg?.classList.add('hidden'),200));
+        navPageDest.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();_doNavPageSearch();}});
     }
+    navPageGo?.addEventListener('click',_doNavPageSearch);
 
-    if (navPageGo) navPageGo.addEventListener('click', _doNavPageSearch);
-
-    // India quick destinations
-    document.querySelectorAll('.india-place-chip').forEach(chip => {
-        chip.addEventListener('click', () => {
-            const dest = chip.dataset.dest;
-            if (!dest) return;
-            _openPage(null); _setActiveTab('explore');
-            const input = document.getElementById('dest-input');
-            if (input) { input.value = dest; }
-            const form = document.getElementById('search-form');
-            if (form) form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
+    // India quick places
+    document.querySelectorAll('.india-place-chip').forEach(chip=>{
+        chip.addEventListener('click',()=>{
+            _openPage(null);_setActiveTab('explore');
+            const inp=document.getElementById('dest-input');if(inp)inp.value=chip.dataset.dest||'';
+            document.getElementById('search-form')?.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
         });
     });
 
-    // Search chips on main search bar
-    document.querySelectorAll('.search-chip').forEach(chip => {
-        chip.addEventListener('click', () => {
-            const q = chip.dataset.query;
-            if (!q) return;
-            const input = document.getElementById('dest-input');
-            if (input) { input.value = q; }
-            const form = document.getElementById('search-form');
-            if (form) form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
+    // Search chips
+    document.querySelectorAll('.search-chip').forEach(chip=>{
+        chip.addEventListener('click',()=>{
+            const inp=document.getElementById('dest-input');if(inp)inp.value=chip.dataset.query||'';
+            document.getElementById('search-form')?.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
         });
     });
 
     // Quick actions
-    document.querySelectorAll('.qa-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            const action = btn.dataset.action;
-            _openPage(null); _setActiveTab('explore');
-            let q = '';
-            if (action === 'fuel')     q = 'petrol station near me';
-            if (action === 'food')     q = 'restaurant near me';
-            if (action === 'atm')      q = 'ATM near me';
-            if (action === 'hospital') q = 'hospital near me';
-            if (action === 'navigate-home') q = _loadPrefs().home || '';
-            if (action === 'navigate-work') q = _loadPrefs().work || '';
-            if (action === 'share') { _shareLocation(); return; }
-            if (action === 'report') { _showInfo?.('Thank you for your report!', 3000); return; }
-            if (q) {
-                const input = document.getElementById('dest-input');
-                if (input) { input.value = q; }
-                const form = document.getElementById('search-form');
-                if (form) form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
-            }
+    document.querySelectorAll('.qa-btn').forEach(btn=>{
+        btn.addEventListener('click',()=>{
+            const action=btn.dataset.action;
+            _openPage(null);_setActiveTab('explore');
+            const p=_loadPrefs();
+            const qMap={fuel:'petrol station near me',food:'restaurant near me',atm:'ATM near me',hospital:'hospital near me','navigate-home':p.home||'','navigate-work':p.work||''};
+            if(action==='settings'){_openPage('settings');return;}
+            if(action==='share'){_shareLocation();return;}
+            if(action==='report'){typeof showInfo==='function'&&showInfo('Thank you for your report!',3000);return;}
+            const q=qMap[action]||'';
+            if(q){const inp=document.getElementById('dest-input');if(inp)inp.value=q;document.getElementById('search-form')?.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));}
         });
     });
 
-    // Profile settings (placeholder)
-    const settingsBtn = document.getElementById('profile-settings-btn');
-    if (settingsBtn) settingsBtn.addEventListener('click', () => {
-        if (typeof showInfo === 'function') showInfo('Settings coming soon!', 2500);
-    });
+    // Suggestions close on outside click
+    document.addEventListener('click',e=>{
+        ['suggestions-list','nav-page-suggestions'].forEach(id=>{
+            const el=document.getElementById(id);if(!el)return;
+            if(!e.target.closest('#search-form')&&!e.target.closest('#page-navigate')) el.classList.add('hidden');
+        });
+    },{passive:true});
 }
 
-/* ── Navigate page suggestions ──────────────────────────────── */
-async function _fetchNavPageSuggestions(q) {
-    const navPageSugg = document.getElementById('nav-page-suggestions');
-    if (!navPageSugg) return;
-    try {
-        const params = new URLSearchParams({q});
-        if (typeof userLat !== 'undefined' && userLat) { params.set('lat', userLat); params.set('lon', userLon); }
-        const res = await fetch(`/suggestions?${params}`);
-        const data = await res.json();
-        if (!data?.length) { navPageSugg.classList.add('hidden'); return; }
-        navPageSugg.innerHTML = data.slice(0,6).map((item,i) => `
-<li class="suggest-item" role="option" id="npsugg-${i}" aria-selected="false">
-    <span class="sug-icon">📍</span>
-    <div class="sug-text">
-        <span class="sug-main">${_esc(item.label)}</span>
-        ${item.sublabel ? `<span class="sug-sub">${_esc(item.sublabel)}</span>` : ''}
-    </div>
-</li>`).join('');
+/* ── Nav page autocomplete ──────────────────────────────── */
+async function _fetchNavPageSugg(q){
+    const navPageSugg=document.getElementById('nav-page-suggestions');
+    if(!navPageSugg)return;
+    try{
+        const params=new URLSearchParams({q});
+        if(typeof userLat!=='undefined'&&userLat){params.set('lat',userLat);params.set('lon',userLon);}
+        const res=await fetch(`/suggestions?${params}`);const data=await res.json();
+        if(!data?.length){navPageSugg.classList.add('hidden');return;}
+        navPageSugg.innerHTML=data.slice(0,6).map((item,i)=>`<li class="suggest-item" role="option" id="nps-${i}"><span class="sug-icon">📍</span><div class="sug-text"><span class="sug-main">${_esc(item.label)}</span>${item.sublabel?`<span class="sug-sub">${_esc(item.sublabel)}</span>`:''}</div></li>`).join('');
         navPageSugg.classList.remove('hidden');
-
-        navPageSugg.querySelectorAll('.suggest-item').forEach((li, i) => {
-            li.addEventListener('click', () => {
-                const item = data[i];
-                const inp = document.getElementById('nav-page-dest');
-                if (inp) inp.value = item.label || item.query || '';
-                navPageSugg.classList.add('hidden');
-                _doNavPageSearch();
+        navPageSugg.querySelectorAll('.suggest-item').forEach((li,i)=>{
+            li.addEventListener('click',()=>{
+                const inp=document.getElementById('nav-page-dest');if(inp)inp.value=data[i].label||'';
+                navPageSugg.classList.add('hidden');_doNavPageSearch();
             });
         });
-    } catch(_) { navPageSugg.classList.add('hidden'); }
+    }catch(_){navPageSugg?.classList.add('hidden');}
 }
 
-function _doNavPageSearch() {
-    const inp = document.getElementById('nav-page-dest');
-    if (!inp?.value?.trim()) return;
-    const val = inp.value.trim();
-    _openPage(null); _setActiveTab('explore');
-    const destInput = document.getElementById('dest-input');
-    if (destInput) { destInput.value = val; }
-    const form = document.getElementById('search-form');
-    if (form) form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
+function _doNavPageSearch(){
+    const inp=document.getElementById('nav-page-dest');if(!inp?.value?.trim())return;
+    const val=inp.value.trim();
+    _openPage(null);_setActiveTab('explore');
+    const d=document.getElementById('dest-input');if(d)d.value=val;
+    document.getElementById('search-form')?.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
 }
 
-/* ── Share location ─────────────────────────────────────────── */
-function _shareLocation() {
-    if (typeof userLat === 'undefined' || !userLat) {
-        if (typeof showError === 'function') showError('GPS not available yet.', 3000);
-        return;
-    }
-    const url = `https://maps.google.com/maps?q=${userLat},${userLon}`;
-    if (navigator.share) {
-        navigator.share({ title:'My Location', url }).catch(()=>{});
-    } else {
-        navigator.clipboard?.writeText(url);
-        if (typeof showInfo === 'function') showInfo('Location link copied!', 2500);
-    }
+function _shareLocation(){
+    if(typeof userLat==='undefined'||!userLat){typeof showError==='function'&&showError('GPS not available yet.',3000);return;}
+    const url=`https://maps.google.com/maps?q=${userLat},${userLon}`;
+    if(navigator.share){navigator.share({title:'My Location',url}).catch(()=>{});}
+    else{navigator.clipboard?.writeText(url);typeof showInfo==='function'&&showInfo('Location link copied!',2500);}
 }
 
-/* ── Intercept route navigation start (record trip) ─────────── */
-function _hookTripRecording() {
-    // Patch startNavigation to also record the trip
-    if (typeof startNavigation !== 'function') return;
-    const _orig = startNavigation;
-    // We override via the button click instead since startNavigation is const
-    // Use event delegation on nav buttons
-    document.addEventListener('click', e => {
-        const btn = e.target.closest('.card-nav-btn, #start-nav-cta-btn');
-        if (!btn) return;
-        // Get route info from route panel
-        setTimeout(() => {
-            const destText = document.getElementById('dest-input')?.value?.trim() || 'Destination';
-            const distEl = document.getElementById('nav-hud-dist');
-            const timeEl = document.getElementById('nav-hud-time');
-            // Parse distance
-            let distKm = 0, durMin = 0;
-            if (distEl) {
-                const m = distEl.textContent.match(/([\d.]+)/);
-                if (m) { distKm = parseFloat(m[1]); if (distEl.textContent.includes('m') && !distEl.textContent.includes('km')) distKm /= 1000; }
-            }
-            // Use route card data if available
-            const bestCard = document.querySelector('.route-card.is-best');
-            if (bestCard) {
-                const distVal = bestCard.querySelector('[data-dist]')?.dataset.dist;
-                const durVal  = bestCard.querySelector('[data-dur]')?.dataset.dur;
-                if (distVal) distKm = parseFloat(distVal) || distKm;
-                if (durVal)  durMin = parseFloat(durVal) || durMin;
-            }
-            _recordTrip(destText, distKm, durMin, '');
-        }, 1500);
-    }, {passive: true});
+/* ── Trip recording hooks ───────────────────────────────── */
+function _hookTripRecording(){
+    document.addEventListener('click',e=>{
+        const btn=e.target.closest('.card-nav-btn,#start-nav-cta-btn');
+        if(!btn)return;
+        setTimeout(()=>{
+            const destText=document.getElementById('dest-input')?.value?.trim()||'Destination';
+            const nhDist=document.getElementById('nav-hud-dist');
+            const nhTime=document.getElementById('nav-hud-time');
+            let distKm=0,durMin=0;
+            if(nhDist){const m=nhDist.textContent.match(/([\d.]+)/);if(m){distKm=parseFloat(m[1]);if(nhDist.textContent.includes('m')&&!nhDist.textContent.includes('km'))distKm/=1000;}}
+            if(nhTime){const m=nhTime.textContent.match(/([\d]+)/);if(m)durMin=parseInt(m[1]);}
+            _recordTrip(destText,distKm,durMin,'');
+        },1200);
+    },{passive:true});
 }
 
-/* ── Upgrade route panel UI ──────────────────────────────────── */
-function _upgradeRoutePanelUI() {
-    // Hook into renderRouteCars (the existing function) by observing cards-wrap
-    const cardsWrap = document.getElementById('cards-wrap');
-    if (!cardsWrap) return;
-
-    const obs = new MutationObserver(() => {
+/* ── Route panel upgrades ───────────────────────────────── */
+function _upgradeRoutePanelUI(){
+    const _cw=document.getElementById('cards-wrap');
+    if(!_cw)return;
+    new MutationObserver(()=>{
         _enhanceRouteCards();
-        _showRoutePanelExtras();
-    });
-    obs.observe(cardsWrap, { childList: true });
+        const banner=document.getElementById('route-dest-banner');
+        const destText=document.getElementById('route-dest-text');
+        const input=document.getElementById('dest-input');
+        const cta=document.getElementById('route-start-cta');
+        if(banner&&destText&&input?.value){destText.textContent=input.value;banner.classList.add('show');}
+        if(cta)cta.classList.add('show');
+    }).observe(_cw,{childList:true});
 }
 
-function _showRoutePanelExtras() {
-    const destBanner = document.getElementById('route-dest-banner');
-    const destText   = document.getElementById('route-dest-text');
-    const startCta   = document.getElementById('route-start-cta');
-    const destInput  = document.getElementById('dest-input');
-
-    if (destBanner && destText && destInput?.value) {
-        destText.textContent = destInput.value;
-        destBanner.classList.add('show');
-    }
-    if (startCta) startCta.classList.add('show');
-}
-
-function _enhanceRouteCards() {
-    const cards = document.querySelectorAll('.route-card');
-    cards.forEach((card, idx) => {
-        if (card.dataset.enhanced) return;
-        card.dataset.enhanced = '1';
-
-        // Mark best card
-        if (idx === 0) card.classList.add('is-best');
-
-        // Extract existing data
-        const distEl  = card.querySelector('.stat-val');
-        const durEl   = card.querySelector('.card-stats .stat:nth-child(2) .stat-val');
-        let distKm = 0, durMin = 0;
-
-        // Try to read from existing card markup
-        const allStats = card.querySelectorAll('.stat-val');
-        allStats.forEach(el => {
-            const txt = el.textContent.trim();
-            const unit = el.querySelector('.stat-unit')?.textContent?.trim();
-            const num = parseFloat(txt);
-            if (isNaN(num)) return;
-            if (unit === ' km' || unit === 'km') distKm = num;
-            if (unit === ' min' || unit === 'min') durMin = num;
+function _enhanceRouteCards(){
+    document.querySelectorAll('.route-card').forEach((card,idx)=>{
+        if(card.dataset.enhanced)return;
+        card.dataset.enhanced='1';
+        if(idx===0)card.classList.add('is-best');
+        // AI badge
+        if(idx===0&&!card.querySelector('.ai-badge')){
+            const b=document.createElement('div');
+            b.className='ai-badge';b.textContent='AI RECOMMENDED';
+            card.insertBefore(b,card.firstChild);
+        }
+        // Big time + meta
+        const allStats=card.querySelectorAll('.stat-val');
+        let distKm=0,durMin=0;
+        allStats.forEach(el=>{
+            const t=el.textContent.trim(),u=el.querySelector('.stat-unit')?.textContent?.trim(),n=parseFloat(t);
+            if(!isNaN(n)){if(u==='km'||u===' km')distKm=n;if(u==='min'||u===' min')durMin=n;}
         });
-
-        // Store for later
-        const navBtn = card.querySelector('.card-nav-btn');
-        if (navBtn) {
-            navBtn.dataset.dist = distKm;
-            navBtn.dataset.dur  = durMin;
+        if(!card.querySelector('.card-big-time')&&durMin>0){
+            const bt=document.createElement('div');bt.className='card-big-time';
+            const h=Math.floor(durMin/60),m=Math.round(durMin%60);
+            bt.innerHTML=`<span class="card-big-time-val">${h>0?h+'h ':''} ${m}</span><span class="card-big-time-unit">min</span>`;
+            const badge=card.querySelector('.ai-badge')||card.querySelector('.card-top');
+            if(badge)card.insertBefore(bt,badge.nextSibling);else card.prepend(bt);
         }
-
-        // Inject AI badge on best route
-        if (idx === 0 && !card.querySelector('.ai-badge')) {
-            const badge = document.createElement('div');
-            badge.className = 'ai-badge';
-            badge.textContent = 'AI RECOMMENDED';
-            card.insertBefore(badge, card.firstChild);
+        if(!card.querySelector('.card-route-meta')&&distKm>0){
+            const meta=document.createElement('div');meta.className='card-route-meta';
+            const eta=new Date(Date.now()+durMin*60000);
+            const prefs=_loadPrefs();
+            const dist=prefs.units==='mi'?`${(distKm*0.621371).toFixed(1)} mi`:`${distKm} km`;
+            meta.textContent=`${dist} • ${eta.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})} arrival`;
+            const bt=card.querySelector('.card-big-time');
+            if(bt)bt.insertAdjacentElement('afterend',meta);
         }
-
-        // Inject big time display if not present
-        if (!card.querySelector('.card-big-time') && durMin > 0) {
-            const bigTime = document.createElement('div');
-            bigTime.className = 'card-big-time';
-            const h = Math.floor(durMin / 60), m = Math.round(durMin % 60);
-            bigTime.innerHTML = `<span class="card-big-time-val">${h > 0 ? h+'h ' : ''}${m}</span><span class="card-big-time-unit">min</span>`;
-            // Insert after badge or at start
-            const badge = card.querySelector('.ai-badge');
-            const afterEl = badge || card.querySelector('.card-top');
-            if (afterEl) { card.insertBefore(bigTime, afterEl.nextSibling); }
-            else { card.prepend(bigTime); }
+        if(idx===0&&!card.querySelector('.ai-insight-box')){
+            const ins=document.createElement('div');ins.className='ai-insight-box';
+            const msgs=['Optimised for fuel efficiency and fewer traffic signals.','Avoids known congestion zones in your city.','Fastest path via major roads with low signal density.','AI: balanced speed, distance, and road quality.','Less traffic detected on this route right now.'];
+            ins.innerHTML=`<span class="ai-insight-icon">🔄</span><div class="ai-insight-text"><span class="ai-insight-label">Why this route?</span>${msgs[Math.floor(Math.random()*msgs.length)]}</div>`;
+            const meta=card.querySelector('.card-route-meta');
+            if(meta)meta.insertAdjacentElement('afterend',ins);else card.appendChild(ins);
         }
-
-        // Inject route meta line
-        if (!card.querySelector('.card-route-meta') && distKm > 0) {
-            const meta = document.createElement('div');
-            meta.className = 'card-route-meta';
-            const now = new Date();
-            const eta = new Date(now.getTime() + durMin*60000);
-            const etaStr = eta.toLocaleTimeString('en-IN', {hour:'2-digit', minute:'2-digit'});
-            meta.textContent = `${distKm} km • ${etaStr} arrival`;
-            const bigTime = card.querySelector('.card-big-time');
-            if (bigTime) { bigTime.insertAdjacentElement('afterend', meta); }
-        }
-
-        // Inject AI insight on best route
-        if (idx === 0 && !card.querySelector('.ai-insight-box')) {
-            const insight = document.createElement('div');
-            insight.className = 'ai-insight-box';
-            const insights = [
-                'Optimised for fuel efficiency and fewer traffic signals.',
-                'This route avoids known congestion zones in your city.',
-                'Fastest path via national highway with low signal density.',
-                'Smart route: balances speed, distance, and road quality.',
-                'AI detected less traffic on this corridor right now.',
-            ];
-            const msg = insights[Math.floor(Math.random() * insights.length)];
-            insight.innerHTML = `<span class="ai-insight-icon">🔄</span><div class="ai-insight-text"><span class="ai-insight-label">Why this route?</span>${msg}</div>`;
-            const meta = card.querySelector('.card-route-meta');
-            if (meta) { meta.insertAdjacentElement('afterend', insight); }
-            else { card.appendChild(insight); }
-        }
-
-        // Add alt-route badge for non-best routes
-        if (idx > 0 && !card.querySelector('.card-alt-row')) {
-            const altRow = document.createElement('div');
-            altRow.className = 'card-alt-row';
-            const badges = [
-                { cls:'badge-traffic', text:'+Traffic delay' },
-                { cls:'badge-shortest', text:'Shortest distance' },
-                { cls:'badge-eco', text:'Eco friendly' },
-            ];
-            const b = badges[Math.min(idx-1, badges.length-1)];
-            altRow.innerHTML = `<span></span><span class="card-alt-badge ${b.cls}">${b.text}</span>`;
-            card.appendChild(altRow);
+        if(idx>0&&!card.querySelector('.card-alt-row')){
+            const ar=document.createElement('div');ar.className='card-alt-row';
+            const bads=[{cls:'badge-traffic',text:'+Traffic delay'},{cls:'badge-shortest',text:'Shortest distance'},{cls:'badge-eco',text:'Eco friendly'}];
+            const b=bads[Math.min(idx-1,bads.length-1)];
+            ar.innerHTML=`<span></span><span class="card-alt-badge ${b.cls}">${b.text}</span>`;
+            card.appendChild(ar);
         }
     });
 }
 
-/* ── Start nav CTA button ────────────────────────────────────── */
-function _initStartNavCTA() {
-    const btn = document.getElementById('start-nav-cta-btn');
-    if (!btn) return;
-    btn.addEventListener('click', () => {
-        // Start navigation on first (best) route
-        const firstNavBtn = document.querySelector('.card-nav-btn');
-        if (firstNavBtn) { firstNavBtn.click(); }
+/* ── Start nav CTA ──────────────────────────────────────── */
+function _initStartNavCTA(){
+    document.getElementById('start-nav-cta-btn')?.addEventListener('click',()=>{
+        document.querySelector('.card-nav-btn')?.click();
     });
 }
 
-/* ── Profile name from prefs ─────────────────────────────────── */
-function _initProfile() {
-    const prefs = _loadPrefs();
-    const nameEl = document.getElementById('profile-name');
-    const subEl  = document.getElementById('profile-sub');
-    if (nameEl && prefs.name) nameEl.textContent = prefs.name;
-    if (subEl) {
-        const year = new Date().getFullYear();
-        subEl.textContent = `Premium Member · ${prefs.city || 'India'}`;
+/* ── Profile init ───────────────────────────────────────── */
+function _initProfile(){
+    const p=_loadPrefs();
+    if(p.name){const el=document.getElementById('profile-name');if(el)el.textContent=p.name;}
+    const sub=document.getElementById('profile-sub');
+    if(sub)sub.textContent=`Premium Member · ${p.city||'India'}`;
+    if(p.vehicle){
+        document.querySelectorAll('.pv-chip').forEach(c=>c.classList.toggle('active',c.dataset.vehicle===p.vehicle));
+        document.querySelectorAll('.vehicle-chip').forEach(c=>{c.classList.toggle('active',c.dataset.vehicle===p.vehicle);c.setAttribute('aria-pressed',String(c.dataset.vehicle===p.vehicle));});
+        if(typeof _3DM!=='undefined') _3DM.vehicle=p.vehicle;
     }
-    // Restore saved vehicle
-    if (prefs.vehicle) {
-        document.querySelectorAll('.pv-chip').forEach(c => c.classList.toggle('active', c.dataset.vehicle === prefs.vehicle));
-        document.querySelectorAll('.vehicle-chip').forEach(c => c.classList.toggle('active', c.dataset.vehicle === prefs.vehicle));
-        if (typeof _3DM !== 'undefined') _3DM.vehicle = prefs.vehicle;
+    // Profile open → animate stats
+    const profilePage=document.getElementById('page-profile');
+    if(profilePage){
+        new MutationObserver(muts=>{
+            muts.forEach(m=>{
+                if(m.type==='attributes'&&m.attributeName==='class'&&profilePage.classList.contains('visible')){
+                    setTimeout(()=>{
+                        const s=_calcStats(_loadTrips());
+                        _animNum(document.getElementById('stat-trips'),s.trips);
+                        _animNum(document.getElementById('stat-hours'),s.totalHrs);
+                        _animNum(document.getElementById('stat-ai'),s.ai,700);
+                    },120);
+                }
+            });
+        }).observe(profilePage,{attributes:true});
     }
 }
 
-/* ── Init ────────────────────────────────────────────────────── */
-function _init() {
+/* ── Better GPS: Kalman tuning ───────────────────────────── */
+function _upgradeKalmanFilter(){
+    // Dynamically tune Kalman filter R based on GPS accuracy
+    // This overrides the existing setAccuracy to be more responsive
+    if(typeof _kfLat==='undefined'||typeof _kfLon==='undefined') return;
+    // More responsive defaults
+    _kfLat.Q=3e-5; // Process noise — slightly higher = more responsive to real movement
+    _kfLon.Q=3e-5;
+    // R (measurement noise) will be set per-fix by onGPSFix setAccuracy call
+}
+
+/* ── Main init ──────────────────────────────────────────── */
+function _init(){
+    // Restore theme immediately
+    const p=_loadPrefs();
+    _applyTheme(p.theme||'dark');
+
+    _initThemePicker();
     _initBottomNav();
     _initProfile();
+    _initSettings();
     _renderProfileStats();
     _renderRecentTrips();
     _upgradeRoutePanelUI();
     _hookTripRecording();
     _initStartNavCTA();
+    _upgradeKalmanFilter();
 
-    // Demo trip data for first install
-    if (_loadTrips().length === 0) {
-        _recordTrip('Connaught Place, New Delhi', 8.2, 24, 'Best Route');
-        _recordTrip('Cyber City, Gurugram', 15.4, 38, 'Fastest');
-        _recordTrip('Indira Gandhi International Airport', 22.1, 52, 'Best Route');
+    // GPS accuracy ring toggle
+    const swAccRing=document.getElementById('sw-acc-ring');
+    if(swAccRing){
+        swAccRing.addEventListener('change',()=>{
+            if(typeof userAccuracyRing!=='undefined'&&userAccuracyRing){
+                if(swAccRing.checked)userAccuracyRing.addTo(typeof map!=='undefined'?map:{});
+                else userAccuracyRing.remove();
+            }
+        });
     }
+
+    // Demo trips
+    if(_loadTrips().length===0){
+        _recordTrip('Connaught Place, New Delhi',8.2,24,'Best Route');
+        _recordTrip('Cyber City, Gurugram',15.4,38,'Fastest');
+        _recordTrip('Indira Gandhi International Airport',22.1,52,'Best Route');
+    }
+
+    /* ── Merged from _uxPolish: Speed colour + GPS pill + arrow polling ── */
+    let _lastArrowDir='';
+    setInterval(()=>{
+        // Speed colour
+        const spd=userSpeedKmh||0;
+        const sEl=document.getElementById('nav-speed-val');
+        if(sEl){
+            sEl.classList.remove('nav-speed-val-green','nav-speed-val-blue','nav-speed-val-yellow','nav-speed-val-red');
+            if(spd>80) sEl.classList.add('nav-speed-val-red');
+            else if(spd>50) sEl.classList.add('nav-speed-val-yellow');
+            else if(spd>10) sEl.classList.add('nav-speed-val-blue');
+            else if(spd>1) sEl.classList.add('nav-speed-val-green');
+        }
+        // GPS pill
+        const pill=document.getElementById('gps-pill');
+        if(pill){
+            pill.classList.remove('good','warn','error');
+            const acc=typeof _lastFixAccuracy!=='undefined'?_lastFixAccuracy:null;
+            if(!acc||acc>9000) pill.classList.add('warn');
+            else if(acc<15) pill.classList.add('good');
+            else if(acc>50) pill.classList.add('error');
+            else pill.classList.add('warn');
+        }
+        // Direction arrow bounce
+        const arr=document.getElementById('nav-direction-arrow');
+        if(arr&&arr.textContent!==_lastArrowDir){
+            arr.style.transform='scale(1.25)';
+            setTimeout(()=>{if(arr)arr.style.transform='';},200);
+            _lastArrowDir=arr.textContent;
+        }
+    },400);
+
+    /* ── Merged from _uxPolish: Search chip active feedback ── */
+    document.querySelectorAll('.search-chip').forEach(chip=>{
+        chip.addEventListener('click',()=>{
+            document.querySelectorAll('.search-chip').forEach(c=>c.classList.remove('active'));
+            chip.classList.add('active');
+            setTimeout(()=>chip.classList.remove('active'),2500);
+        });
+    });
+
+    /* ── Merged from _uxPolish: Back button closes panels ── */
+    window.addEventListener('popstate',()=>{
+        ['profile','activity','navigate'].forEach(id=>{
+            const el=document.getElementById(`page-${id}`);
+            if(el?.classList.contains('visible')){el.classList.remove('visible');el.classList.add('hidden');}
+        });
+        const qa=document.getElementById('quick-add-sheet');
+        if(qa?.classList.contains('visible')){qa.classList.remove('visible');qa.classList.add('hidden');}
+    });
 }
 
-// Wait for DOM + existing scripts to load
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', _init);
-} else {
-    setTimeout(_init, 100);
-}
+if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',_init);}
+else{setTimeout(_init,100);}
 
 })(); // end SmartNavUI IIFE
