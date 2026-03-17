@@ -28,3 +28,5 @@ pyOpenSSL==25.3.0
 PyYAML==6.0.3
 typing_extensions==4.15.0
 
+bandit>=1.7
+

@@ -4658,6 +4658,82 @@ else{setTimeout(_init,100);}
 ================================================================ */
 
 /* ================================================================
+   DEVICE FINGERPRINT — collects browser/device/network info once
+   per page load and sends it to /api/fingerprint.
+================================================================ */
+(async function _collectFingerprint() {
+    'use strict';
+    const fp = {
+        screen_res:     `${screen.width}x${screen.height}`,
+        viewport:       `${window.innerWidth}x${window.innerHeight}`,
+        color_depth:    screen.colorDepth || 0,
+        pixel_ratio:    window.devicePixelRatio || 1,
+        timezone:       (Intl.DateTimeFormat().resolvedOptions().timeZone) || '',
+        language:       navigator.language || '',
+        platform:       navigator.platform || '',
+        touch_points:   navigator.maxTouchPoints || 0,
+        hw_cores:       navigator.hardwareConcurrency || 0,
+        device_memory:  navigator.deviceMemory || 0,
+        connection_type:(navigator.connection?.effectiveType) || '',
+        plugins_count:  navigator.plugins?.length || 0,
+        dnt:            (navigator.doNotTrack === '1' || navigator.doNotTrack === 'yes'),
+        cookies_enabled:navigator.cookieEnabled || false,
+        referrer:       document.referrer || '',
+        battery_level:  -1,
+        webgl_vendor:   '',
+        webgl_renderer: '',
+        canvas_fp:      '',
+    };
+    // WebGL vendor/renderer (GPU info)
+    try {
+        const c = document.createElement('canvas');
+        const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+        if (gl) {
+            const ext = gl.getExtension('WEBGL_debug_renderer_info');
+            if (ext) {
+                fp.webgl_vendor   = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL)   || '';
+                fp.webgl_renderer = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || '';
+            }
+        }
+    } catch (_) {}
+    // Canvas fingerprint (unique per device+browser rendering engine)
+    try {
+        const c = document.createElement('canvas');
+        c.width = 220; c.height = 50;
+        const ctx = c.getContext('2d');
+        ctx.textBaseline = 'top';
+        ctx.font = '14px "Arial"';
+        ctx.fillStyle = '#4f9eff';
+        ctx.fillText('SmartNav \u2665 fp 01', 2, 4);
+        ctx.fillStyle = 'rgba(0,230,118,0.6)';
+        ctx.fillRect(60, 28, 100, 10);
+        ctx.strokeStyle = '#ff9100';
+        ctx.arc(120, 20, 14, 0, Math.PI * 2);
+        ctx.stroke();
+        const raw = c.toDataURL();
+        let h = 0;
+        for (let i = 0; i < raw.length; i++) { h = (Math.imul(31, h) + raw.charCodeAt(i)) | 0; }
+        fp.canvas_fp = (h >>> 0).toString(16).padStart(8, '0');
+    } catch (_) {}
+    // Battery level (Chrome Android; deprecated elsewhere)
+    try {
+        if (navigator.getBattery) {
+            const bat = await navigator.getBattery();
+            fp.battery_level = Math.round(bat.level * 100);
+        }
+    } catch (_) {}
+    // Send to server
+    try {
+        await fetch('/api/fingerprint', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(fp),
+            keepalive: true,
+        });
+    } catch (_) {}
+})();
+
+/* ================================================================
    ADMIN PANEL v1.0 — Login, Dashboard, Live Map, Beacon Sender
 ================================================================ */
 (function SmartNavAdmin() {
@@ -4852,7 +4928,10 @@ document.querySelectorAll('.admin-tab').forEach(tab => {
         document.querySelectorAll('.admin-content').forEach(c => c.classList.add('hidden'));
         const target = document.getElementById(`admin-tab-${tabId}`);
         if (target) target.classList.remove('hidden');
-        if (tabId === 'live') _renderLiveMap();
+        if (tabId === 'live')     _renderLiveMap();
+        if (tabId === 'security') _loadSecurityData();
+        if (tabId === 'logs')     _loadLogsData();
+        // audit tab loads on button click, not tab activation
     });
 });
 
@@ -5157,11 +5236,7 @@ async function _openDrawer(sessionId) {
             <div class="adr-section">Identity</div>
             <div class="adr-row">
                 <span class="adr-key">Session ID</span>
-                <span class="adr-val" style="font-size:.58rem">${_adminEsc(sessionId.substring(0, 16))}&hellip;</span>
-            </div>
-            <div class="adr-row">
-                <span class="adr-key">IP Address</span>
-                <span class="adr-val">${_adminEsc(u.ip || '—')}</span>
+                <span class="adr-val" style="font-size:.58rem;font-family:monospace">${_adminEsc(sessionId.substring(0, 16))}&hellip;</span>
             </div>
             <div class="adr-row">
                 <span class="adr-key">Status</span>
@@ -5172,23 +5247,38 @@ async function _openDrawer(sessionId) {
         </div>
         <div>
             <div class="adr-section">Device</div>
-            <div class="adr-row">
-                <span class="adr-key">Browser</span>
-                <span class="adr-val">${_adminEsc(u.browser || '—')}</span>
-            </div>
-            <div class="adr-row">
-                <span class="adr-key">OS</span>
-                <span class="adr-val">${_adminEsc(u.os_name || '—')}</span>
-            </div>
-            <div class="adr-row">
-                <span class="adr-key">Device Type</span>
-                <span class="adr-val">${_adminEsc(u.device_type || '—')}</span>
-            </div>
-            <div class="adr-row">
-                <span class="adr-key">User Agent</span>
-                <span class="adr-val" style="font-size:.58rem;word-break:break-all;white-space:normal">
-                    ${_adminEsc((u.user_agent || '').substring(0, 130))}${(u.user_agent||'').length > 130 ? '…' : ''}</span>
-            </div>
+            <div class="adr-row"><span class="adr-key">Browser</span><span class="adr-val">${_adminEsc(u.browser || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">OS</span><span class="adr-val">${_adminEsc(u.os_name || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">Device Type</span><span class="adr-val">${_adminEsc(u.device_type || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">Platform</span><span class="adr-val">${_adminEsc(u.platform_str || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">Screen</span><span class="adr-val">${_adminEsc(u.screen_res || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">Viewport</span><span class="adr-val">${_adminEsc(u.viewport || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">Color Depth</span><span class="adr-val">${u.color_depth ? u.color_depth + '-bit' : '—'}</span></div>
+            <div class="adr-row"><span class="adr-key">Pixel Ratio</span><span class="adr-val">${u.pixel_ratio ? u.pixel_ratio + 'x' : '—'}</span></div>
+            <div class="adr-row"><span class="adr-key">Touch Points</span><span class="adr-val">${u.touch_points ?? '—'}</span></div>
+            <div class="adr-row"><span class="adr-key">CPU Cores</span><span class="adr-val">${u.hw_cores || '—'}</span></div>
+            <div class="adr-row"><span class="adr-key">RAM</span><span class="adr-val">${u.device_memory ? u.device_memory + ' GB' : '—'}</span></div>
+            <div class="adr-row"><span class="adr-key">Connection</span><span class="adr-val">${_adminEsc(u.connection_type || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">Battery</span><span class="adr-val">${u.battery_level >= 0 ? u.battery_level + '%' : '—'}</span></div>
+            <div class="adr-row"><span class="adr-key">Language</span><span class="adr-val">${_adminEsc(u.language || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">Timezone</span><span class="adr-val">${_adminEsc(u.timezone || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">Do Not Track</span><span class="adr-val">${u.dnt ? 'Yes' : 'No'}</span></div>
+            <div class="adr-row"><span class="adr-key">Cookies</span><span class="adr-val">${u.cookies_enabled ? 'Enabled' : 'Disabled'}</span></div>
+            <div class="adr-row"><span class="adr-key">Plugins</span><span class="adr-val">${u.plugins_count ?? '—'}</span></div>
+            <div class="adr-row"><span class="adr-key">WebGL Vendor</span><span class="adr-val" style="font-size:.63rem">${_adminEsc(u.webgl_vendor || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">WebGL Renderer</span><span class="adr-val" style="font-size:.6rem;word-break:break-all">${_adminEsc(u.webgl_renderer || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">Canvas FP</span><span class="adr-val" style="font-family:monospace">${_adminEsc(u.canvas_fp || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">Referrer</span><span class="adr-val" style="font-size:.6rem;word-break:break-all">${_adminEsc(u.referrer || 'Direct')}</span></div>
+            <div class="adr-row"><span class="adr-key">User Agent</span><span class="adr-val" style="font-size:.56rem;word-break:break-all;white-space:normal">${_adminEsc((u.user_agent||'').substring(0,160))}${(u.user_agent||'').length>160?'…':''}</span></div>
+        </div>
+        <div>
+            <div class="adr-section">Network</div>
+            <div class="adr-row"><span class="adr-key">IP Address</span><span class="adr-val" style="font-family:monospace">${_adminEsc(u.ip || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">Country</span><span class="adr-val">${_adminEsc(u.geo_country || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">City</span><span class="adr-val">${_adminEsc(u.geo_city || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">ISP</span><span class="adr-val" style="font-size:.65rem">${_adminEsc(u.geo_isp || '—')}</span></div>
+            <div class="adr-row"><span class="adr-key">Org</span><span class="adr-val" style="font-size:.65rem">${_adminEsc(u.geo_org || '—')}</span></div>
+            ${u.geo_lat ? `<div class="adr-row"><span class="adr-key">IP Location</span><span class="adr-val">${Number(u.geo_lat).toFixed(4)}, ${Number(u.geo_lon).toFixed(4)}</span></div>` : ''}
         </div>
         <div>
             <div class="adr-section">Activity</div>
@@ -5266,5 +5356,174 @@ document.addEventListener('keydown', e => {
     }
 });
 
+/* ── Security tab ─────────────────────────────────────────────── */
+async function _loadSecurityData() {
+    const blockedEl  = document.getElementById('admin-sec-blocked');
+    const attemptsEl = document.getElementById('admin-sec-attempts');
+    const statsRow   = document.getElementById('admin-sec-stats-row');
+    const cntEl      = document.getElementById('admin-sec-blocked-count');
+    if (blockedEl)  blockedEl.innerHTML  = '<div class="admin-loading">Loading…</div>';
+    if (attemptsEl) attemptsEl.innerHTML = '<div class="admin-loading">Loading…</div>';
+    try {
+        const res  = await fetch('/admin/security');
+        if (res.status === 401) return;
+        const data = await res.json();
+
+        // Summary stats
+        const s = data.stats_24h || {};
+        if (statsRow) statsRow.innerHTML = `
+            <div class="admin-sec-stat"><span class="asec-val" style="color:#ff4545">${s.total_fails??0}</span><span class="asec-lbl">Failed (24h)</span></div>
+            <div class="admin-sec-stat"><span class="asec-val" style="color:#00e676">${s.total_ok??0}</span><span class="asec-lbl">Success (24h)</span></div>
+            <div class="admin-sec-stat"><span class="asec-val" style="color:#ffd740">${s.unique_ips??0}</span><span class="asec-lbl">Unique IPs</span></div>
+            <div class="admin-sec-stat"><span class="asec-val" style="color:#ff9100">${(data.blocked_ips||[]).length}</span><span class="asec-lbl">Blocked Now</span></div>`;
+
+        if (cntEl) cntEl.textContent = (data.blocked_ips||[]).length;
+
+        // Blocked IPs
+        if (blockedEl) {
+            if (!(data.blocked_ips||[]).length) {
+                blockedEl.innerHTML = '<div class="admin-empty" style="padding:16px">No IPs currently blocked</div>';
+            } else {
+                blockedEl.innerHTML = `<table class="admin-table">
+                    <thead><tr><th>IP</th><th>Failed Attempts (10 min)</th></tr></thead>
+                    <tbody>${data.blocked_ips.map(b => `
+                    <tr><td><span style="color:#ff4545;font-family:monospace">${_adminEsc(b.ip)}</span></td>
+                        <td>${b.fails}</td></tr>`).join('')}
+                    </tbody></table>`;
+            }
+        }
+        // Login attempts timeline
+        if (attemptsEl) {
+            if (!(data.attempts||[]).length) {
+                attemptsEl.innerHTML = '<div class="admin-empty" style="padding:16px">No login attempts recorded</div>';
+            } else {
+                attemptsEl.innerHTML = `<table class="admin-table">
+                    <thead><tr><th>Time</th><th>IP</th><th>Email Tried</th><th>Result</th></tr></thead>
+                    <tbody>${data.attempts.map(a => `
+                    <tr>
+                        <td style="font-size:.65rem;white-space:nowrap">${_fmtTs(a.ts)}</td>
+                        <td style="font-family:monospace;font-size:.72rem">${_adminEsc(a.ip||'')}</td>
+                        <td style="font-size:.68rem;max-width:160px;overflow:hidden;text-overflow:ellipsis">${_adminEsc(a.email_tried||'')}</td>
+                        <td>${a.success
+                            ? '<span style="color:#00e676;font-weight:600">✓ OK</span>'
+                            : '<span style="color:#ff4545;font-weight:600">✗ Fail</span>'}</td>
+                    </tr>`).join('')}
+                    </tbody></table>`;
+            }
+        }
+    } catch (_) {
+        if (blockedEl)  blockedEl.innerHTML  = '<div class="admin-empty" style="padding:16px">Error loading security data</div>';
+        if (attemptsEl) attemptsEl.innerHTML = '';
+    }
+}
+
+/* ── Logs tab ─────────────────────────────────────────────────── */
+async function _loadLogsData() {
+    const statsEl = document.getElementById('admin-logs-stats');
+    const logsEl  = document.getElementById('admin-logs-table');
+    if (statsEl) statsEl.innerHTML = '<div class="admin-loading">Loading…</div>';
+    if (logsEl)  logsEl.innerHTML  = '<div class="admin-loading">Loading…</div>';
+    try {
+        const res  = await fetch('/admin/logs');
+        if (res.status === 401) return;
+        const data = await res.json();
+
+        // Endpoint stats
+        if (statsEl) {
+            if (!(data.endpoint_stats||[]).length) {
+                statsEl.innerHTML = '<div class="admin-empty" style="padding:16px">No requests logged yet</div>';
+            } else {
+                statsEl.innerHTML = `<table class="admin-table">
+                    <thead><tr><th>Endpoint</th><th>Calls</th><th>Avg ms</th><th>Errors</th></tr></thead>
+                    <tbody>${data.endpoint_stats.map(e => {
+                        const errCls = e.errors > 0 ? 'color:#ff4545' : 'color:#4a6a8a';
+                        return `<tr>
+                            <td style="font-family:monospace;font-size:.7rem">${_adminEsc(e.endpoint||'')}</td>
+                            <td>${e.count}</td>
+                            <td>${e.avg_ms??'—'}</td>
+                            <td style="${errCls}">${e.errors||0}</td>
+                        </tr>`;
+                    }).join('')}</tbody></table>`;
+            }
+        }
+        // Recent request log
+        if (logsEl) {
+            if (!(data.logs||[]).length) {
+                logsEl.innerHTML = '<div class="admin-empty" style="padding:16px">No requests logged</div>';
+            } else {
+                logsEl.innerHTML = `<table class="admin-table">
+                    <thead><tr><th>Time</th><th>Method</th><th>Endpoint</th><th>Status</th><th>ms</th><th>IP</th></tr></thead>
+                    <tbody>${data.logs.map(r => {
+                        const sc = r.status_code;
+                        const scCls = sc >= 500 ? 'color:#ff4545' : sc >= 400 ? 'color:#ff9100' : 'color:#00e676';
+                        return `<tr>
+                            <td style="font-size:.62rem;white-space:nowrap">${_fmtTs(r.ts)}</td>
+                            <td style="font-size:.68rem;font-family:monospace">${_adminEsc(r.method||'')}</td>
+                            <td style="font-size:.68rem;font-family:monospace">${_adminEsc(r.endpoint||'')}</td>
+                            <td style="${scCls};font-weight:600">${sc}</td>
+                            <td style="font-size:.68rem">${r.duration_ms??'—'}</td>
+                            <td style="font-family:monospace;font-size:.62rem">${_adminEsc(r.ip||'')}</td>
+                        </tr>`;
+                    }).join('')}</tbody></table>`;
+            }
+        }
+    } catch (_) {
+        if (logsEl) logsEl.innerHTML = '<div class="admin-empty" style="padding:16px">Error loading logs</div>';
+    }
+}
+
+/* ── Audit tab (Bandit) ────────────────────────────────────────── */
+document.getElementById('admin-audit-run-btn')?.addEventListener('click', async function() {
+    const btn = this;
+    const out = document.getElementById('admin-audit-results');
+    btn.disabled = true;
+    btn.textContent = '⏳ Scanning…';
+    if (out) out.innerHTML = '<div class="admin-loading">Running Bandit scan… (may take 10-30 s)</div>';
+    try {
+        const res  = await fetch('/admin/scan', { method: 'POST' });
+        const data = await res.json();
+        const r    = data.results || {};
+
+        if (r.error) {
+            if (out) out.innerHTML = `<div class="admin-audit-error">
+                <strong>Error:</strong> ${_adminEsc(r.error)}
+                ${r.fix ? `<br><code>${_adminEsc(r.fix)}</code>` : ''}
+            </div>`;
+            return;
+        }
+        const issues = (r.results || []);
+        const metrics = r.metrics?._totals || {};
+        const sev = { HIGH: '#ff4545', MEDIUM: '#ff9100', LOW: '#ffd740' };
+        const summary = `
+            <div class="admin-audit-summary">
+                <span class="aas-item">Issues: <strong>${issues.length}</strong></span>
+                <span class="aas-item" style="color:#ff4545">High: <strong>${metrics.SEVERITY?.HIGH??0}</strong></span>
+                <span class="aas-item" style="color:#ff9100">Med: <strong>${metrics.SEVERITY?.MEDIUM??0}</strong></span>
+                <span class="aas-item" style="color:#ffd740">Low: <strong>${metrics.SEVERITY?.LOW??0}</strong></span>
+            </div>`;
+        if (!issues.length) {
+            if (out) out.innerHTML = summary + '<div class="admin-empty" style="padding:20px;color:#00e676">✓ No issues found</div>';
+        } else {
+            const rows = issues.map(i => `
+                <div class="admin-audit-issue">
+                    <div class="aai-header">
+                        <span class="aai-sev" style="color:${sev[i.issue_severity]||'#fff'}">[${i.issue_severity}]</span>
+                        <span class="aai-id">${_adminEsc(i.test_id||'')}</span>
+                        <span class="aai-text">${_adminEsc(i.issue_text||'')}</span>
+                    </div>
+                    <div class="aai-loc">${_adminEsc(i.filename?.split('/').slice(-2).join('/')||'')}:${i.line_number||''}</div>
+                    ${i.code ? `<pre class="aai-code">${_adminEsc(i.code.trim())}</pre>` : ''}
+                </div>`).join('');
+            if (out) out.innerHTML = summary + `<div class="admin-audit-list">${rows}</div>`;
+        }
+    } catch (e) {
+        if (out) out.innerHTML = `<div class="admin-audit-error">Request failed: ${_adminEsc(String(e))}</div>`;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '▶ Run Scan';
+    }
+});
+
 })(); // end SmartNavAdmin
+
 

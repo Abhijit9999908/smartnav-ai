@@ -635,6 +635,9 @@
                 <button class="admin-tab active" data-tab="overview">Overview</button>
                 <button class="admin-tab" data-tab="users">Users</button>
                 <button class="admin-tab" data-tab="live">Live Map</button>
+                <button class="admin-tab" data-tab="security">Security</button>
+                <button class="admin-tab" data-tab="logs">API Logs</button>
+                <button class="admin-tab" data-tab="audit">Audit</button>
             </div>
         </div>
         <div class="admin-topbar-right">
@@ -712,6 +715,48 @@
         <div id="admin-live-map" style="width:100%;height:calc(100% - 90px);border-radius:var(--r-md);overflow:hidden;"></div>
     </div>
 
+    <!-- SECURITY TAB -->
+    <div class="admin-content hidden" id="admin-tab-security">
+        <div class="admin-security-stats" id="admin-sec-stats-row"></div>
+        <div class="admin-section-head">
+            <span>Blocked IPs</span>
+            <span class="admin-sec-badge" id="admin-sec-blocked-count">0</span>
+        </div>
+        <div class="admin-table-wrap" id="admin-sec-blocked">
+            <div class="admin-loading">Loading…</div>
+        </div>
+        <div class="admin-section-head"><span>Login Attempts (last 200)</span></div>
+        <div class="admin-table-wrap" id="admin-sec-attempts">
+            <div class="admin-loading">Loading…</div>
+        </div>
+    </div>
+
+    <!-- LOGS TAB -->
+    <div class="admin-content hidden" id="admin-tab-logs">
+        <div class="admin-section-head"><span>Endpoint Stats — last hour</span></div>
+        <div class="admin-table-wrap" id="admin-logs-stats">
+            <div class="admin-loading">Loading…</div>
+        </div>
+        <div class="admin-section-head"><span>Recent Requests (last 500)</span></div>
+        <div class="admin-table-wrap" id="admin-logs-table">
+            <div class="admin-loading">Loading…</div>
+        </div>
+    </div>
+
+    <!-- AUDIT TAB -->
+    <div class="admin-content hidden" id="admin-tab-audit">
+        <div class="admin-section-head">
+            <span>Python Security Audit (Bandit)</span>
+            <button id="admin-audit-run-btn" class="admin-audit-run-btn">▶ Run Scan</button>
+        </div>
+        <div id="admin-audit-results" class="admin-table-wrap">
+            <div class="admin-empty">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="rgba(79,158,255,.3)" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                <span>Click "Run Scan" to audit your Python code for security issues.</span>
+            </div>
+        </div>
+    </div>
+
     <!-- User detail drawer -->
     <div id="admin-user-drawer" class="admin-drawer hidden">
         <div class="admin-drawer-head">
@@ -735,4 +780,5 @@
 <script src="/static/script.js" defer></script>
 </body>
 </html>
+
 

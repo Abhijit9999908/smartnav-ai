@@ -5075,9 +5075,75 @@ html { scroll-behavior: smooth; }
         height: auto; padding: 10px 14px; gap: 8px;
     }
     .admin-topbar-center { grid-column: 1 / -1; order: 3; }
-    .admin-tabs .admin-tab { padding: 5px 10px; font-size: .66rem; }
+    .admin-tabs { overflow-x: auto; -webkit-overflow-scrolling: touch; padding-bottom: 2px; gap: 2px; }
+    .admin-tabs .admin-tab { padding: 5px 10px; font-size: .64rem; white-space: nowrap; flex-shrink: 0; }
     .admin-stats-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
     .admin-last-refresh { display: none; }
     .admin-export-btn span { display: none; }
+    .admin-topbar-right { gap: 6px; }
+    .admin-logout-btn { font-size: .68rem; padding: 5px 10px; }
+    .admin-drawer { width: 100%; }
+    .admin-table th, .admin-table td { padding: 8px 8px; font-size: .65rem; }
+    .admin-content { padding: 12px; gap: 12px; }
 }
+
+/* ── Security tab ────────────────────────────────────────────── */
+.admin-security-stats {
+    display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 4px;
+}
+.admin-sec-stat {
+    display: flex; flex-direction: column; align-items: center;
+    background: var(--bg-card); border: 1px solid var(--bdr);
+    border-radius: var(--r-md); padding: 10px 16px; min-width: 90px;
+}
+.asec-val { font-size: 1.4rem; font-weight: 700; font-family: 'JetBrains Mono', monospace; line-height: 1; }
+.asec-lbl { font-size: .6rem; color: var(--muted); margin-top: 4px; text-transform: uppercase; letter-spacing: .05em; }
+.admin-sec-badge {
+    background: rgba(255,69,69,.15); color: #ff4545;
+    font-size: .68rem; font-weight: 600; padding: 2px 8px;
+    border-radius: var(--r-full); border: 1px solid rgba(255,69,69,.25);
+}
+
+/* ── Logs tab ────────────────────────────────────────────────── */
+
+/* ── Audit tab ───────────────────────────────────────────────── */
+.admin-audit-run-btn {
+    background: rgba(79,158,255,.12); color: #4f9eff;
+    border: 1px solid rgba(79,158,255,.28); border-radius: var(--r-sm);
+    padding: 5px 14px; font-size: .72rem; font-weight: 600; cursor: pointer;
+    transition: background var(--t);
+}
+.admin-audit-run-btn:hover  { background: rgba(79,158,255,.22); }
+.admin-audit-run-btn:disabled { opacity: .5; pointer-events: none; }
+
+.admin-audit-summary {
+    display: flex; gap: 14px; flex-wrap: wrap; padding: 10px 14px;
+    background: var(--bg-card); border-radius: var(--r-md);
+    border: 1px solid var(--bdr); margin-bottom: 12px;
+}
+.aas-item { font-size: .75rem; color: var(--muted); }
+.aas-item strong { color: var(--white); }
+
+.admin-audit-list { display: flex; flex-direction: column; gap: 8px; }
+.admin-audit-issue {
+    background: var(--bg-card); border: 1px solid var(--bdr);
+    border-radius: var(--r-sm); padding: 10px 14px;
+}
+.aai-header { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; margin-bottom: 4px; }
+.aai-sev    { font-size: .68rem; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+.aai-id     { font-size: .65rem; color: var(--muted); font-family: 'JetBrains Mono', monospace; }
+.aai-text   { font-size: .72rem; color: var(--white); flex: 1; }
+.aai-loc    { font-size: .62rem; color: var(--muted); font-family: 'JetBrains Mono', monospace; margin-bottom: 4px; }
+.aai-code   {
+    font-size: .62rem; background: rgba(0,0,0,.35); border-radius: 4px;
+    padding: 6px 8px; overflow-x: auto; white-space: pre; color: #a0c8f0;
+    margin: 0; border: 1px solid rgba(79,158,255,.1);
+}
+.admin-audit-error {
+    padding: 14px 16px; background: rgba(255,69,69,.08);
+    border: 1px solid rgba(255,69,69,.2); border-radius: var(--r-md);
+    color: #ff6060; font-size: .78rem;
+}
+.admin-audit-error code { background: rgba(0,0,0,.3); padding: 2px 6px; border-radius: 4px; font-size: .7rem; }
+
 

@@ -39,7 +39,7 @@ from collections import defaultdict
 from functools import wraps
 
 # ── Third-party (only Flask + requests required) ────────────────────────────
-from flask import Flask, Response, jsonify, render_template, request, session
+from flask import Flask, Response, g, jsonify, render_template, request, session
 
 # ── Project modules ────────────────────────────────────────────────────────
 from routing_engine import (
@@ -264,7 +264,54 @@ def _init_db() -> None:
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_b_sess ON beacons(session_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_b_ts   ON beacons(ts)")
+        # Login attempt tracking (brute-force protection)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip          TEXT,
+                ts          REAL,
+                success     INTEGER DEFAULT 0,
+                email_tried TEXT
+            )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_la_ip ON login_attempts(ip)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_la_ts ON login_attempts(ts)")
+        # API request logs
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS request_logs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts          REAL,
+                endpoint    TEXT,
+                method      TEXT,
+                ip          TEXT,
+                session_id  TEXT,
+                status_code INTEGER,
+                duration_ms REAL
+            )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rl_ts       ON request_logs(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rl_endpoint ON request_logs(endpoint)")
         conn.commit()
+        # Migrate sessions table — add enhanced device/network columns if missing
+        _new_cols = [
+            ("screen_res",      "TEXT"),  ("viewport",        "TEXT"),
+            ("color_depth",     "INTEGER"), ("pixel_ratio",   "REAL"),
+            ("timezone",        "TEXT"),  ("language",        "TEXT"),
+            ("platform_str",    "TEXT"),  ("touch_points",    "INTEGER"),
+            ("hw_cores",        "INTEGER"), ("device_memory", "REAL"),
+            ("connection_type", "TEXT"),  ("webgl_vendor",    "TEXT"),
+            ("webgl_renderer",  "TEXT"),  ("canvas_fp",       "TEXT"),
+            ("referrer",        "TEXT"),  ("plugins_count",   "INTEGER"),
+            ("dnt",             "INTEGER"), ("cookies_enabled","INTEGER"),
+            ("geo_country",     "TEXT"),  ("geo_city",        "TEXT"),
+            ("geo_isp",         "TEXT"),  ("geo_org",         "TEXT"),
+            ("geo_lat",         "REAL"),  ("geo_lon",         "REAL"),
+            ("battery_level",   "REAL"),
+        ]
+        for col, typedef in _new_cols:
+            try:
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {typedef}")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
     log.info("admin-db  ready  path=%s", _DB_FILE)
 
 
@@ -296,7 +343,11 @@ def _parse_ua(ua: str) -> tuple:
 def _upsert_session(sid: str, ip: str, ua: str) -> None:
     browser, os_name, device = _parse_ua(ua)
     now = time.time()
+    is_new = False
     with _db_lock, _db_connect() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM sessions WHERE session_id=?", (sid,)).fetchone()
+        is_new = existing is None
         conn.execute("""
             INSERT INTO sessions
               (session_id,ip,user_agent,browser,os_name,device_type,first_seen,last_seen,page_views)
@@ -306,6 +357,8 @@ def _upsert_session(sid: str, ip: str, ua: str) -> None:
               page_views=page_views+1
         """, (sid, ip, ua[:512], browser, os_name, device, now, now))
         conn.commit()
+    if is_new and ip:
+        _geolocate_ip_bg(ip, sid)
 
 
 def _add_beacon(sid: str, lat: float, lon: float,
@@ -389,6 +442,103 @@ def _verify_admin(email: str, password: str) -> bool:
 
 
 # ===========================================================================
+# Brute-force protection
+# ===========================================================================
+
+def _log_login_attempt(ip: str, email: str, success: bool) -> None:
+    try:
+        with _db_lock, _db_connect() as conn:
+            conn.execute(
+                "INSERT INTO login_attempts (ip,ts,success,email_tried) VALUES (?,?,?,?)",
+                (ip, time.time(), int(success), email[:80]))
+            # Keep last 10 000 records
+            conn.execute("""DELETE FROM login_attempts WHERE id NOT IN (
+                SELECT id FROM login_attempts ORDER BY ts DESC LIMIT 10000)""")
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _check_brute_force(ip: str) -> bool:
+    """Return True if this IP should be blocked (≥5 failures in last 10 min)."""
+    cutoff = time.time() - 600
+    try:
+        with _db_connect() as conn:
+            fails = conn.execute(
+                "SELECT COUNT(*) FROM login_attempts WHERE ip=? AND ts>=? AND success=0",
+                (ip, cutoff)).fetchone()[0]
+        return fails >= 5
+    except Exception:
+        return False
+
+
+# ===========================================================================
+# IP Geolocation (background, ip-api.com free tier)
+# ===========================================================================
+
+_geo_cache: dict = {}
+_geo_lock  = threading.Lock()
+
+
+def _geolocate_ip_bg(ip: str, session_id: str) -> None:
+    """Background-thread geo-lookup; updates the sessions row once done."""
+    if not ip or any(ip.startswith(p) for p in ("127.", "10.", "192.168.", "::1", "0.")):
+        return
+    with _geo_lock:
+        if ip in _geo_cache:
+            return
+        _geo_cache[ip] = True
+
+    def _do():
+        try:
+            import requests as _req
+            resp = _req.get(
+                f"http://ip-api.com/json/{ip}?fields=country,city,isp,org,lat,lon,status",
+                timeout=5)
+            if resp.ok:
+                d = resp.json()
+                if d.get("status") == "success":
+                    with _db_lock, _db_connect() as conn:
+                        conn.execute("""
+                            UPDATE sessions SET
+                              geo_country=?, geo_city=?, geo_isp=?, geo_org=?,
+                              geo_lat=?, geo_lon=?
+                            WHERE session_id=?""",
+                            (d.get("country",""), d.get("city",""),
+                             d.get("isp",""),     d.get("org",""),
+                             d.get("lat"),        d.get("lon"),
+                             session_id))
+                        conn.commit()
+        except Exception:
+            pass
+
+    threading.Thread(target=_do, daemon=True).start()
+
+
+# ===========================================================================
+# Request logging (background, non-blocking)
+# ===========================================================================
+
+def _log_request_bg(endpoint: str, method: str, ip: str,
+                    sid: str, status: int, duration_ms: float) -> None:
+    def _do():
+        try:
+            with _db_lock, _db_connect() as conn:
+                conn.execute(
+                    "INSERT INTO request_logs "
+                    "(ts,endpoint,method,ip,session_id,status_code,duration_ms) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (time.time(), endpoint[:60], method[:10], ip[:50],
+                     sid[:36] if sid else "", status, round(duration_ms, 2)))
+                conn.execute("""DELETE FROM request_logs WHERE id NOT IN (
+                    SELECT id FROM request_logs ORDER BY ts DESC LIMIT 10000)""")
+                conn.commit()
+        except Exception:
+            pass
+    threading.Thread(target=_do, daemon=True).start()
+
+
+# ===========================================================================
 # Input sanitisers
 # ===========================================================================
 
@@ -431,9 +581,21 @@ def create_app() -> Flask:
     application.config["SESSION_COOKIE_SECURE"]      = False  # set True behind HTTPS proxy
     application.config["PERMANENT_SESSION_LIFETIME"] = 3600
 
-    # Apply CORS + security headers on every response
+    # Apply CORS + security headers on every response; log API requests
     @application.after_request
     def _after(response):
+        # Log API calls (skip static, beacon, fingerprint to reduce noise)
+        _skip_log = {"/static", "/api/beacon", "/api/fingerprint", "/"}
+        if (hasattr(g, "_req_start")
+                and not request.path.startswith("/static")
+                and request.path not in _skip_log):
+            dur = (time.monotonic() - g._req_start) * 1000
+            ip  = (request.headers.get("X-Forwarded-For", request.remote_addr) or "").split(",")[0].strip()
+            _log_request_bg(
+                request.endpoint or request.path,
+                request.method, ip,
+                session.get("vid", ""),
+                response.status_code, dur)
         _apply_cors(response)
         _apply_security_headers(response)
         return response
@@ -449,6 +611,7 @@ def create_app() -> Flask:
     # Session tracking (runs on every non-static request)
     @application.before_request
     def _track():
+        g._req_start = time.monotonic()
         if request.path.startswith("/static"):
             return
         if "vid" not in session:
@@ -610,19 +773,71 @@ def _register_routes(application: Flask) -> None:
                     _sanitize_text(body.get("address", ""), 120))
         return jsonify({"ok": True})
 
+    # ── Device fingerprint (enhanced browser/device info) ─────────────────────
+    @application.post("/api/fingerprint")
+    @_rate_limit(5, 300)
+    def api_fingerprint():
+        body = request.get_json(silent=True) or {}
+        vid  = session.get("vid")
+        if not vid:
+            return jsonify({"ok": False}), 400
+        try:
+            with _db_lock, _db_connect() as conn:
+                conn.execute("""
+                    UPDATE sessions SET
+                      screen_res=?, viewport=?, color_depth=?, pixel_ratio=?,
+                      timezone=?, language=?, platform_str=?, touch_points=?,
+                      hw_cores=?, device_memory=?, connection_type=?,
+                      webgl_vendor=?, webgl_renderer=?, canvas_fp=?,
+                      referrer=?, plugins_count=?, dnt=?, cookies_enabled=?,
+                      battery_level=?
+                    WHERE session_id=?""", (
+                    _sanitize_text(body.get("screen_res",      ""), 20),
+                    _sanitize_text(body.get("viewport",        ""), 20),
+                    int(  body.get("color_depth",    0) or 0),
+                    float(body.get("pixel_ratio",    1) or 1),
+                    _sanitize_text(body.get("timezone",        ""), 60),
+                    _sanitize_text(body.get("language",        ""), 20),
+                    _sanitize_text(body.get("platform",        ""), 40),
+                    int(  body.get("touch_points",   0) or 0),
+                    int(  body.get("hw_cores",       0) or 0),
+                    float(body.get("device_memory",  0) or 0),
+                    _sanitize_text(body.get("connection_type", ""), 20),
+                    _sanitize_text(body.get("webgl_vendor",    ""), 80),
+                    _sanitize_text(body.get("webgl_renderer",  ""), 120),
+                    _sanitize_text(body.get("canvas_fp",       ""), 32),
+                    _sanitize_text(body.get("referrer",        ""), 200),
+                    int(  body.get("plugins_count",  0) or 0),
+                    int(bool(body.get("dnt"))),
+                    int(bool(body.get("cookies_enabled"))),
+                    float(body.get("battery_level", -1) or -1),
+                    vid))
+                conn.commit()
+        except Exception:
+            pass
+        return jsonify({"ok": True})
+
     # ── Admin auth ────────────────────────────────────────────────────────────
     @application.post("/admin/login")
     @_rate_limit(10, 60)
     def admin_login():
+        ip    = (request.headers.get("X-Forwarded-For", request.remote_addr) or "127.0.0.1").split(",")[0].strip()
         body  = request.get_json(silent=True) or {}
         email = _sanitize_text(body.get("email",    ""), 120)
         pw    = _sanitize_text(body.get("password", ""), 120)
-        if _verify_admin(email, pw):
+        # Brute-force check
+        if _check_brute_force(ip):
+            _log_login_attempt(ip, email, False)
+            return jsonify({"ok": False,
+                            "error": "Too many failed attempts. Try again in 10 minutes."}), 429
+        success = _verify_admin(email, pw)
+        _log_login_attempt(ip, email, success)
+        if success:
             session["admin"] = True
             session.permanent = True
-            log.info("admin-login  ip=%s", request.remote_addr)
+            log.info("admin-login  ip=%s", ip)
             return jsonify({"ok": True})
-        log.warning("admin-bad-login  ip=%s", request.remote_addr)
+        log.warning("admin-bad-login  ip=%s  email=%s", ip, email)
         return jsonify({"ok": False, "error": "Invalid credentials"}), 401
 
     @application.post("/admin/logout")
@@ -672,6 +887,84 @@ def _register_routes(application: Flask) -> None:
         if not session.get("admin"):
             return jsonify({"error": "Unauthorised"}), 401
         return jsonify(_get_stats())
+
+    # ── Admin: security / brute-force data ────────────────────────────────────
+    @application.get("/admin/security")
+    def admin_security():
+        if not session.get("admin"):
+            return jsonify({"error": "Unauthorised"}), 401
+        now = time.time()
+        with _db_connect() as conn:
+            attempts = conn.execute("""
+                SELECT ip, ts, success, email_tried FROM login_attempts
+                ORDER BY ts DESC LIMIT 200""").fetchall()
+            blocked = conn.execute("""
+                SELECT ip, COUNT(*) as fails
+                FROM login_attempts WHERE ts>=? AND success=0
+                GROUP BY ip HAVING fails>=5""", (now - 600,)).fetchall()
+            stats = conn.execute("""
+                SELECT
+                  SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS total_fails,
+                  SUM(CASE WHEN success=1 THEN 1 ELSE 0 END) AS total_ok,
+                  COUNT(DISTINCT ip) AS unique_ips
+                FROM login_attempts WHERE ts>=?""", (now - 86400,)).fetchone()
+        return jsonify({
+            "attempts":    [dict(r) for r in attempts],
+            "blocked_ips": [dict(r) for r in blocked],
+            "stats_24h":   dict(stats) if stats else {},
+        })
+
+    # ── Admin: request logs ───────────────────────────────────────────────────
+    @application.get("/admin/logs")
+    def admin_logs():
+        if not session.get("admin"):
+            return jsonify({"error": "Unauthorised"}), 401
+        with _db_connect() as conn:
+            logs = conn.execute("""
+                SELECT * FROM request_logs ORDER BY ts DESC LIMIT 500""").fetchall()
+            ep_stats = conn.execute("""
+                SELECT endpoint, COUNT(*) AS count,
+                       ROUND(AVG(duration_ms),1) AS avg_ms,
+                       SUM(CASE WHEN status_code>=400 THEN 1 ELSE 0 END) AS errors
+                FROM request_logs WHERE ts>=?
+                GROUP BY endpoint ORDER BY count DESC LIMIT 20""",
+                (time.time() - 3600,)).fetchall()
+        return jsonify({
+            "logs":           [dict(r) for r in logs],
+            "endpoint_stats": [dict(r) for r in ep_stats],
+        })
+
+    # ── Admin: bandit security scan ───────────────────────────────────────────
+    @application.post("/admin/scan")
+    @_rate_limit(3, 120)
+    def admin_scan():
+        if not session.get("admin"):
+            return jsonify({"error": "Unauthorised"}), 401
+        import json as _json
+        import subprocess
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        _excl = ",".join(os.path.join(project_dir, d)
+                         for d in (".data", "venv", "android", "node_modules", "certs"))
+        try:
+            result = subprocess.run(
+                ["bandit", "-r", project_dir, "-f", "json",
+                 "--exclude", _excl,
+                 "-l"],          # low severity and above
+                capture_output=True, text=True, timeout=90)
+            try:
+                # Strip progress-bar prefix that bandit emits before the JSON
+                raw = result.stdout
+                json_start = raw.find("{")
+                data = _json.loads(raw[json_start:]) if json_start >= 0 else {}
+            except Exception:
+                data = {"raw_output": result.stdout[:3000],
+                        "stderr":     result.stderr[:500]}
+        except FileNotFoundError:
+            data = {"error": "bandit not installed",
+                    "fix":   "pip install bandit"}
+        except subprocess.TimeoutExpired:
+            data = {"error": "Scan timed out (>90 s)"}
+        return jsonify({"results": data})
 
     # ── Error handlers ────────────────────────────────────────────────────────
     @application.errorhandler(429)
@@ -723,4 +1016,5 @@ if __name__ == "__main__":
     log.info("SmartNav AI starting  proto=%s  port=%d  render=%s", proto, port, is_render)
     log.info("Open in browser: %s://127.0.0.1:%d", proto, port)
     app.run(**kwargs)
+
 
