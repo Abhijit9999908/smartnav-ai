@@ -28,6 +28,26 @@
 
 'use strict';
 
+/* ── Library guard ───────────────────────────────────────────── */
+// Show a helpful message if Leaflet failed to load from CDN
+if (typeof L === 'undefined') {
+    document.addEventListener('DOMContentLoaded', function () {
+        var mapEl = document.getElementById('map');
+        if (mapEl) {
+            mapEl.style.cssText = 'display:flex;align-items:center;justify-content:center;' +
+                'background:#060b13;color:#e8f0ff;font-family:system-ui;font-size:.9rem;' +
+                'text-align:center;padding:2rem;position:fixed;inset:0;z-index:999;';
+            mapEl.innerHTML = '<div><div style="font-size:2.5rem;margin-bottom:1rem">⚠️</div>' +
+                '<strong style="font-size:1.1rem">Map library failed to load</strong><br><br>' +
+                '<span style="color:#4a6a8a;font-size:.85rem">Check your internet connection and reload.</span><br>' +
+                '<button onclick="location.reload()" style="margin-top:1.2rem;padding:.55rem 1.6rem;' +
+                'background:#4f9eff;color:#fff;border:none;border-radius:8px;cursor:pointer;' +
+                'font-size:.85rem;font-weight:600">Reload Page</button></div>';
+        }
+    });
+    throw new Error('Leaflet (L) is not defined — CDN script failed to load.');
+}
+
 /* ── Canvas renderer ────────────────────────────────────────────── */
 const CANVAS = L.canvas({ padding: 0.5, tolerance: 10 });
 
@@ -413,8 +433,8 @@ class KalmanFilter1D {
     reset() { this.x = null; this.P = 1.0; }
 }
 
-const _kfLat = new KalmanFilter1D();
-const _kfLon = new KalmanFilter1D();
+const _kfLat = new KalmanFilter1D(2.5e-5, 4e-8); // tuned for India road speeds
+const _kfLon = new KalmanFilter1D(2.5e-5, 4e-8);
 
 /* ── State ──────────────────────────────────────────────────────── */
 let userLat = null;
@@ -1041,21 +1061,22 @@ function _startWatchingGPS(forceRestart = false) {
     _kfLat.reset();
     _kfLon.reset();
 
-    // Respect GPS mode preference for battery vs accuracy
-    const _gpsPrefs = (function(){ try { return JSON.parse(localStorage.getItem('smartnav.prefs'))||{}; } catch(_){ return {}; } })();
-    const _gpsMode = _gpsPrefs.gpsMode || 'balanced';
-    const _initialHA = _gpsMode === 'high';             // only high-accuracy on initial fix if user chose 'high'
-    const _watchHA   = _gpsMode !== 'low';               // watch uses high-accuracy unless 'low' (Power Saver)
-    const _watchTimeout = _gpsMode === 'low' ? 30000 : 15000;
+    // Respect GPS accuracy mode from settings
+    let highAccuracy = true;
+    try {
+        const p = JSON.parse(localStorage.getItem('smartnav.prefs.v2') || '{}');
+        highAccuracy = p.gpsMode !== 'low';
+        // Balance mode uses high accuracy but with slightly more maxAge
+    } catch(_) {}
 
     navigator.geolocation.getCurrentPosition(onGPSFix, onGPSError, {
-        enableHighAccuracy: _initialHA, timeout: 8000, maximumAge: 10000,
+        enableHighAccuracy: false, timeout: 8000, maximumAge: 10000,
     });
 
     _gpsWatchId = navigator.geolocation.watchPosition(onGPSFix, onGPSError, {
-        enableHighAccuracy: _watchHA,
-        timeout: _watchTimeout,
-        maximumAge: 0,
+        enableHighAccuracy: highAccuracy,
+        timeout: 15000,
+        maximumAge: highAccuracy ? 0 : 2000,
     });
 }
 
@@ -1078,18 +1099,21 @@ function onGPSFix(pos) {
         return;
     }
 
-    // Respect Kalman smoothing toggle from user settings
-    const _kPrefs = (function(){ try { return JSON.parse(localStorage.getItem('smartnav.prefs'))||{}; } catch(_){ return {}; } })();
-    const _useKalman = _kPrefs.kalmanSmoothing !== false;
-    let lat, lon;
-    if (_useKalman) {
+    // Respect Kalman smoothing preference
+    let lat = rawLat, lon = rawLon;
+    try {
+        const p = JSON.parse(localStorage.getItem('smartnav.prefs.v2') || '{}');
+        if (p.kalmanSmoothing !== false) {
+            _kfLat.setAccuracy(Math.min(acc, 300));
+            _kfLon.setAccuracy(Math.min(acc, 300));
+            lat = _kfLat.update(rawLat);
+            lon = _kfLon.update(rawLon);
+        }
+    } catch(_) {
         _kfLat.setAccuracy(Math.min(acc, 300));
         _kfLon.setAccuracy(Math.min(acc, 300));
         lat = _kfLat.update(rawLat);
         lon = _kfLon.update(rawLon);
-    } else {
-        lat = rawLat;
-        lon = rawLon;
     }
 
     const gpsSpeed = pos.coords.speed;
@@ -1107,12 +1131,12 @@ function onGPSFix(pos) {
     }
     speedKmh = Math.min(speedKmh, 200);
 
-    // 8-sample weighted average for smoother, more responsive speed
     _navSpeedHistory.push(speedKmh);
     if (_navSpeedHistory.length > 8) _navSpeedHistory.shift();
-    const _wTotal = _navSpeedHistory.reduce((s, v, i) => s + v * (i + 1), 0);
-    const _wDiv   = _navSpeedHistory.reduce((s, _, i) => s + (i + 1), 0);
-    userSpeedKmh = _wDiv > 0 ? _wTotal / _wDiv : 0;
+    // Use median for speed to reject GPS outlier spikes
+    const _sortedSpd = [..._navSpeedHistory].sort((a,b)=>a-b);
+    const _mid = Math.floor(_sortedSpd.length/2);
+    userSpeedKmh = _sortedSpd.length%2 ? _sortedSpd[_mid] : (_sortedSpd[_mid-1]+_sortedSpd[_mid])/2;
 
     let rawBearing = null;
     if (gpsHeading !== null && gpsHeading !== undefined && isFinite(gpsHeading) && !isNaN(gpsHeading) && speedKmh > 0.5) {
@@ -1124,7 +1148,11 @@ function onGPSFix(pos) {
 
     if (rawBearing !== null) {
         _rawHeading = rawBearing;
-        const alpha = Math.min(0.55, Math.max(0.15, speedKmh / 80));
+        // Adaptive alpha: fast movement → trust GPS heading more, slow → gentle smooth
+        const alpha = userSpeedKmh > 60 ? 0.65
+                    : userSpeedKmh > 30 ? 0.45
+                    : userSpeedKmh > 5  ? 0.28
+                    : 0.15;
         userHeading = _smoothBearing(userHeading, rawBearing, alpha);
     }
 
@@ -2251,8 +2279,15 @@ function _buildBrowserRouteUrl(startLat, startLon, endLat, endLon, viaLat = null
 }
 
 async function _fetchBrowserRouteRequest(startLat, startLon, endLat, endLon, viaLat = null, viaLon = null, alternatives = 3) {
-    const res = await fetch(_buildBrowserRouteUrl(startLat, startLon, endLat, endLon, viaLat, viaLon, alternatives));
-    const data = await res.json();
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 12000);
+    let res, data;
+    try {
+        res = await fetch(_buildBrowserRouteUrl(startLat, startLon, endLat, endLon, viaLat, viaLon, alternatives), { signal: ctrl.signal });
+        data = await res.json();
+    } catch (e) {
+        throw new Error(e?.name === 'AbortError' ? 'Routing timed out. Check your connection.' : (e.message || 'Live routing service is unavailable.'));
+    } finally { clearTimeout(tid); }
 
     if (!res.ok || data.code !== 'Ok') {
         throw new Error(data.message || data.error || 'Live routing service is unavailable.');
@@ -2343,7 +2378,7 @@ async function _requestRoutesByCoords(startLat, startLon, destLat, destLon) {
     const res = await fetch('/route-coords', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ start_lat: startLat, start_lon: startLon, dest_lat: destLat, dest_lon: destLon }),
+        body: JSON.stringify({ start_lat: startLat, start_lon: startLon, end_lat: destLat, end_lon: destLon }),
     });
     const data = await res.json();
 
@@ -2438,7 +2473,14 @@ searchForm.addEventListener('submit', async (e) => {
     await handleRouteSearch(query, lat, lon);
 });
 
+let _routeAbort = null;
+
 async function handleRouteSearch(dest, lat, lon) {
+    // Cancel any in-flight route request
+    if (_routeAbort) { _routeAbort.abort(); }
+    _routeAbort = new AbortController();
+    const signal = _routeAbort.signal;
+
     stopNavigation(false);
     clearRoutes();
     clearPOI();
@@ -2451,7 +2493,8 @@ async function handleRouteSearch(dest, lat, lon) {
     try {
         const res = await fetch('/route', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ start_lat: lat, start_lon: lon, destination: dest }),
+            body: JSON.stringify({ user_lat: lat, user_lon: lon, destination: dest }),
+            signal,
         });
         const data = await res.json();
         setProgress(75);
@@ -2462,7 +2505,7 @@ async function handleRouteSearch(dest, lat, lon) {
             ? { lat: Number(data.destination.lat), lon: Number(data.destination.lon) }
             : null;
 
-        if ((!res.ok || !data.routes?.length) && resolvedDestination && res.status >= 500) {
+        if ((!res.ok || !data.routes?.length) && resolvedDestination) {
             setLoaderStep('Routing live in browser…');
             setProgress(55);
 
@@ -2510,6 +2553,14 @@ async function handleRouteSearch(dest, lat, lon) {
             chosenDestination = enriched.destination;
         }
 
+        // Guard: ensure all routes have valid geometry before rendering
+        chosenRoutes = chosenRoutes.filter(r =>
+            r && Array.isArray(r.geometry) && r.geometry.length >= 2
+        );
+        if (!chosenRoutes.length) {
+            showError('Routes found but had invalid geometry. Try again.');
+            showLoader(false); return;
+        }
         await _presentRoutes(
             chosenRoutes,
             chosenDestination,
@@ -2519,12 +2570,13 @@ async function handleRouteSearch(dest, lat, lon) {
         );
 
     } catch (err) {
+        if (err?.name === 'AbortError') return; // cancelled by newer search
         showError(err?.message || 'Network error. Is the server running?');
         showLoader(false);
         stopScanAnimation();
         setScanStatus('hide');
     } finally {
-        navBtn.disabled = false;
+        if (!signal.aborted) navBtn.disabled = false;
     }
 }
 
@@ -3204,6 +3256,31 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 const INDIA_BOUNDS = [[68.1, 6.5], [97.5, 37.6]];
 const INDIA_CENTER = [78.9629, 20.5937];
 
+/* ── Safe layer/source helpers — prevent "already exists" crashes ── */
+function _3dmSafeAddLayer(map, layerDef, beforeId) {
+    try {
+        if (map.getLayer(layerDef.id)) {
+            try { map.removeLayer(layerDef.id); } catch(_) {}
+        }
+        if (beforeId && map.getLayer(beforeId)) map.addLayer(layerDef, beforeId);
+        else map.addLayer(layerDef);
+    } catch(e) { console.warn('[3D layer]', layerDef.id, e.message); }
+}
+function _3dmSafeAddSource(map, id, spec) {
+    try {
+        if (map.getSource(id)) { try { map.removeSource(id); } catch(_) {} }
+        map.addSource(id, spec);
+    } catch(e) { console.warn('[3D source]', id, e.message); }
+}
+function _3dmSafeRemoveLayers(map, ids) {
+    ids.forEach(id => {
+        try { if (map.getLayer(id)) map.removeLayer(id); } catch(_) {}
+        // try remove matching source too
+        const srcId = id.replace(/[A-Z]/g,'').replace(/_3(r|b|dest|strt|acc)/,'_3$1').split('.')[0];
+        try { if (id.match(/^_3(r|b|dest|strt|acc)/) && map.getSource(id)) map.removeSource(id); } catch(_) {}
+    });
+}
+
 const _3DM = {
     map:null, active:false, styleReady:false,
     routeLLs:[], routeCoords:[], totalDist:0, travelledDist:0,
@@ -3220,265 +3297,160 @@ const _3DM = {
 
 /* ── Vehicle catalogue ──────────────────────────────────── */
 const _3DM_V = {
-    car:        {color:'#4f9eff',hi:'#c0e0ff',accent:'#2870d4',w:56,h:72},
-    suv:        {color:'#00e676',hi:'#9affd4',accent:'#00b35a',w:60,h:76},
-    motorcycle: {color:'#ff9100',hi:'#ffd080',accent:'#e07800',w:36,h:68},
-    bus:        {color:'#ffd740',hi:'#fff5a0',accent:'#d4aa00',w:66,h:78},
-    truck:      {color:'#ce93d8',hi:'#eadaff',accent:'#a060c0',w:62,h:74},
+    car:        {color:'#4f9eff',hi:'#c0e0ff',w:48,h:62},
+    suv:        {color:'#00e676',hi:'#9affd4',w:52,h:66},
+    motorcycle: {color:'#ff9100',hi:'#ffd080',w:30,h:60},
+    bus:        {color:'#ffd740',hi:'#fff5a0',w:60,h:68},
+    truck:      {color:'#ce93d8',hi:'#eadaff',w:54,h:64},
 };
 
 function _3dmLight(hex,amt){const n=parseInt(hex.replace('#',''),16);return `rgb(${Math.min(255,((n>>16)&255)+amt)},${Math.min(255,((n>>8)&255)+amt)},${Math.min(255,(n&255)+amt)})`;}
 
-/* ── Vehicle marker HTML (3D Realistic) ──────────────── */
+/* ── Vehicle marker HTML ────────────────────────────────── */
 function _3dmMarkerHTML(key) {
     const v = _3DM_V[key] || _3DM_V.car;
-    const {color,hi,accent,w,h} = v;
+    const {color,hi,w,h} = v;
     const hw=w/2, hh=h/2;
-    const isMoto=key==='motorcycle', isBus=key==='bus', isTruck=key==='truck', isSuv=key==='suv';
+    const isMoto=key==='motorcycle', isBus=key==='bus', isTruck=key==='truck';
 
-    /* ---- Body path (top-down silhouette) ---- */
     const bPath = isMoto
-        ? `M0,${-hh*.92} Q${hw*.35},${-hh*.88} ${hw*.42},${-hh*.5} L${hw*.3},${hh*.5} Q0,${hh*.82} ${-hw*.3},${hh*.5} L${-hw*.42},${-hh*.5} Q${-hw*.35},${-hh*.88} 0,${-hh*.92}Z`
+        ? `M0,${-hh*.9} L${hw*.5},${hh*.55} Q0,${hh*.8} ${-hw*.5},${hh*.55}Z`
         : isBus
-        ? `M${-hw*.88},${-hh*.88} Q${-hw*.92},${-hh*.92} ${-hw*.86},${-hh*.92} L${hw*.86},${-hh*.92} Q${hw*.92},${-hh*.92} ${hw*.88},${-hh*.88} L${hw*.90},${hh*.88} Q${hw*.92},${hh*.92} ${hw*.86},${hh*.92} L${-hw*.86},${hh*.92} Q${-hw*.92},${hh*.92} ${-hw*.90},${hh*.88}Z`
+        ? `M${-hw*.88},${-hh*.9} L${hw*.88},${-hh*.9} L${hw*.9},${hh*.9} L${-hw*.9},${hh*.9}Z`
         : isTruck
-        ? `M${-hw*.78},${-hh*.88} Q0,${-hh*.96} ${hw*.78},${-hh*.88} L${hw*.88},${-hh*.28} L${hw*.92},${hh*.88} Q${hw*.90},${hh*.94} 0,${hh*.86} Q${-hw*.90},${hh*.94} ${-hw*.92},${hh*.88} L${-hw*.88},${-hh*.28}Z`
-        : isSuv
-        ? `M0,${-hh*.96} C${hw*.48},${-hh*.96} ${hw*.82},${-hh*.68} ${hw*.78},${hh*.22} Q${hw*.76},${hh*.72} ${hw*.62},${hh*.82} L0,${hh*.78} L${-hw*.62},${hh*.82} Q${-hw*.76},${hh*.72} ${-hw*.78},${hh*.22} C${-hw*.82},${-hh*.68} ${-hw*.48},${-hh*.96} 0,${-hh*.96}Z`
-        : `M0,${-hh*.96} C${hw*.44},${-hh*.96} ${hw*.78},${-hh*.58} ${hw*.74},${hh*.14} Q${hw*.70},${hh*.68} ${hw*.56},${hh*.80} L0,${hh*.76} L${-hw*.56},${hh*.80} Q${-hw*.70},${hh*.68} ${-hw*.74},${hh*.14} C${-hw*.78},${-hh*.58} ${-hw*.44},${-hh*.96} 0,${-hh*.96}Z`;
+        ? `M0,${-hh*.94} L${hw*.82},${-hh*.38} L${hw*.94},${hh*.9} L${-hw*.94},${hh*.9} L${-hw*.82},${-hh*.38}Z`
+        : `M0,${-hh*.96} C${hw*.4},${-hh*.96} ${hw*.76},${hh*.28} ${hw*.72},${hh*.55} Q${hw*.64},${hh*.84} 0,${hh*.76} Q${-hw*.64},${hh*.84} ${-hw*.72},${hh*.55} C${-hw*.76},${hh*.28} ${-hw*.4},${-hh*.96} 0,${-hh*.96}Z`;
 
-    /* ---- Windshield ---- */
     const wPath = isMoto
-        ? `M${-hw*.22},${-hh*.68} Q0,${-hh*.82} ${hw*.22},${-hh*.68} L${hw*.16},${-hh*.38} Q0,${-hh*.52} ${-hw*.16},${-hh*.38}Z`
+        ? `M${-hw*.28},${-hh*.64} Q0,${-hh*.82} ${hw*.28},${-hh*.64} L${hw*.18},${-hh*.34} Q0,${-hh*.52} ${-hw*.18},${-hh*.34}Z`
         : isBus
-        ? `M${-hw*.72},${-hh*.78} L${hw*.72},${-hh*.78} L${hw*.72},${-hh*.44} L${-hw*.72},${-hh*.44}Z`
-        : isTruck
-        ? `M${-hw*.58},${-hh*.72} Q0,${-hh*.84} ${hw*.58},${-hh*.72} L${hw*.48},${-hh*.32} Q0,${-hh*.48} ${-hw*.48},${-hh*.32}Z`
-        : `M${-hw*.48},${-hh*.74} Q0,${-hh*.90} ${hw*.48},${-hh*.74} L${hw*.36},${-hh*.42} Q0,${-hh*.60} ${-hw*.36},${-hh*.42}Z`;
+        ? `M${-hw*.72},${-hh*.76} L${hw*.72},${-hh*.76} L${hw*.72},${-hh*.42} L${-hw*.72},${-hh*.42}Z`
+        : `M${-hw*.44},${-hh*.74} Q0,${-hh*.88} ${hw*.44},${-hh*.74} L${hw*.32},${-hh*.46} Q0,${-hh*.64} ${-hw*.32},${-hh*.46}Z`;
 
-    /* ---- Rear window ---- */
-    const rwPath = isMoto ? '' : isBus ? '' :
-        `<path d="M${-hw*.34},${hh*.36} Q0,${hh*.56} ${hw*.34},${hh*.36} L${hw*.40},${hh*.58} Q0,${hh*.72} ${-hw*.40},${hh*.58}Z" fill="rgba(130,200,255,.35)" stroke="rgba(255,255,255,.12)" stroke-width=".5"/>`;
+    const hlX=[[-hw*.55,-hh*.86],[hw*.55,-hh*.86]];
+    const tlY=hh*(isBus?.84:.70), tlW=hw*.20, tlH=hh*.11;
+    const wFrY=-hh*(isBus?.58:.48), wRrY=hh*(isBus?.68:.64), wR=hw*(isMoto?.2:.14);
+    const wEls=isMoto?'':[-hw*.58,hw*.58].flatMap(cx=>[
+        `<ellipse cx="${cx}" cy="${wFrY}" rx="${wR}" ry="${wR*1.08}" fill="#050810"/>`,
+        `<ellipse cx="${cx}" cy="${wRrY}" rx="${wR}" ry="${wR*1.08}" fill="#050810"/>`,
+        `<ellipse cx="${cx}" cy="${wFrY}" rx="${wR*.5}" ry="${wR*.5}" fill="rgba(60,65,80,.9)"/>`,
+        `<ellipse cx="${cx}" cy="${wRrY}" rx="${wR*.5}" ry="${wR*.5}" fill="rgba(60,65,80,.9)"/>`,
+    ]).join('');
 
-    /* ---- Headlights (warm LED) ---- */
-    const hlY = -hh*.90;
-    const hlW = isMoto ? hw*.16 : hw*.18;
-    const hlH = isMoto ? hh*.04 : hh*.06;
-    const hlX1 = isMoto ? -hw*.18 : -hw*.56;
-    const hlX2 = isMoto ? hw*.18 : hw*.56;
-    const hlGlow = `<ellipse cx="${hlX1}" cy="${hlY}" rx="${hlW*1.8}" ry="${hlH*2.6}" fill="rgba(255,248,220,.10)"/>
-        <ellipse cx="${hlX1}" cy="${hlY}" rx="${hlW}" ry="${hlH}" fill="rgba(255,252,240,.96)"/>
-        <ellipse cx="${hlX2}" cy="${hlY}" rx="${hlW*1.8}" ry="${hlH*2.6}" fill="rgba(255,248,220,.10)"/>
-        <ellipse cx="${hlX2}" cy="${hlY}" rx="${hlW}" ry="${hlH}" fill="rgba(255,252,240,.96)"/>`;
-    // Centre DRL for car/suv
-    const drl = (!isMoto && !isBus && !isTruck) ? `<rect x="${-hw*.14}" y="${hlY-hh*.01}" width="${hw*.28}" height="${hh*.025}" rx="1.5" fill="rgba(255,255,255,.6)"/>` : '';
+    const roofLine=isMoto?'':`<line x1="0" y1="${-hh*.62}" x2="0" y2="${hh*.6}" stroke="rgba(255,255,255,.18)" stroke-width="${isBus?2:1.4}"/>`;
+    const sideWins=(key==='car'||key==='suv')?`<rect x="${-hw*.66}" y="${-hh*.22}" width="${hw*.24}" height="${hh*.28}" rx="3" fill="rgba(140,210,255,.38)"/><rect x="${hw*.42}" y="${-hh*.22}" width="${hw*.24}" height="${hh*.28}" rx="3" fill="rgba(140,210,255,.38)"/>`:'';
+    const busWins=isBus?[0,1,2,3,4].map(i=>`<rect x="${-hw*.68+i*hw*.28}" y="${-hh*.3}" width="${hw*.22}" height="${hh*.3}" rx="2" fill="rgba(140,210,255,.35)"/>`).join(''):'';
 
-    /* ---- Taillights ---- */
-    const tlY = isBus ? hh*.88 : hh*.72;
-    const tlW = hw*.22, tlH = hh*.08;
-    const tlGlow = `<rect x="${-hw*.82}" y="${tlY}" width="${tlW}" height="${tlH}" rx="3" fill="rgba(255,30,30,.95)"/>
-        <rect x="${-hw*.86}" y="${tlY-hh*.01}" width="${tlW*1.4}" height="${tlH*1.6}" rx="4" fill="rgba(255,30,30,.10)"/>
-        <rect x="${hw*.60}" y="${tlY}" width="${tlW}" height="${tlH}" rx="3" fill="rgba(255,30,30,.95)"/>
-        <rect x="${hw*.56}" y="${tlY-hh*.01}" width="${tlW*1.4}" height="${tlH*1.6}" rx="4" fill="rgba(255,30,30,.10)"/>`;
-
-    /* ---- Wheels / tyres ---- */
-    const wR = isMoto ? hw*.24 : hw*.16;
-    const wFrY = isMoto ? -hh*.46 : -hh*.52;
-    const wRrY = isMoto ? hh*.55 : hh*.60;
-    const wxL = isMoto ? 0 : -hw*.62;
-    const wxR = isMoto ? 0 : hw*.62;
-    const wheelSvg = (cx,cy) => `<ellipse cx="${cx}" cy="${cy}" rx="${wR*1.1}" ry="${wR*1.2}" fill="#080c16"/>
-        <ellipse cx="${cx}" cy="${cy}" rx="${wR*.68}" ry="${wR*.72}" fill="#18202e"/>
-        <ellipse cx="${cx}" cy="${cy}" rx="${wR*.32}" ry="${wR*.34}" fill="rgba(90,100,120,.7)"/>`;
-    const wheelsAll = isMoto
-        ? wheelSvg(0,wFrY) + wheelSvg(0,wRrY)
-        : [wxL,wxR].flatMap(cx => [wheelSvg(cx,wFrY), wheelSvg(cx,wRrY)]).join('');
-
-    /* ---- Door/panel lines ---- */
-    const doorLines = isMoto ? '' : isBus
-        ? `<line x1="0" y1="${-hh*.38}" x2="0" y2="${hh*.82}" stroke="rgba(255,255,255,.08)" stroke-width=".8"/>
-           <line x1="${-hw*.44}" y1="${-hh*.38}" x2="${-hw*.44}" y2="${hh*.82}" stroke="rgba(255,255,255,.06)" stroke-width=".6"/>
-           <line x1="${hw*.44}" y1="${-hh*.38}" x2="${hw*.44}" y2="${hh*.82}" stroke="rgba(255,255,255,.06)" stroke-width=".6"/>`
-        : `<line x1="${-hw*.04}" y1="${-hh*.38}" x2="${-hw*.04}" y2="${hh*.60}" stroke="rgba(255,255,255,.10)" stroke-width=".7"/>
-           <line x1="${hw*.04}" y1="${-hh*.38}" x2="${hw*.04}" y2="${hh*.60}" stroke="rgba(255,255,255,.10)" stroke-width=".7"/>`;
-
-    /* ---- Side windows (car/suv only) ---- */
-    const sideWins = (key==='car'||isSuv)
-        ? `<rect x="${-hw*.68}" y="${-hh*.24}" width="${hw*.26}" height="${hh*.30}" rx="3" fill="rgba(130,210,255,.32)" stroke="rgba(255,255,255,.08)" stroke-width=".5"/>
-           <rect x="${hw*.42}" y="${-hh*.24}" width="${hw*.26}" height="${hh*.30}" rx="3" fill="rgba(130,210,255,.32)" stroke="rgba(255,255,255,.08)" stroke-width=".5"/>`
-        : '';
-
-    /* ---- Bus windows ---- */
-    const busWins = isBus
-        ? [0,1,2,3,4].map(i => `<rect x="${-hw*.72+i*hw*.30}" y="${-hh*.30}" width="${hw*.22}" height="${hh*.28}" rx="2.5" fill="rgba(130,210,255,.30)" stroke="rgba(255,255,255,.08)" stroke-width=".4"/>`).join('')
-        : '';
-
-    /* ---- Motorcycle-specific: handlebars + seat ---- */
-    const motoDetails = isMoto
-        ? `<line x1="${-hw*.52}" y1="${-hh*.48}" x2="${hw*.52}" y2="${-hh*.48}" stroke="rgba(200,210,220,.85)" stroke-width="2" stroke-linecap="round"/>
-           <ellipse cx="0" cy="${hh*.08}" rx="${hw*.24}" ry="${hh*.12}" fill="rgba(40,30,20,.8)" stroke="rgba(80,60,40,.4)" stroke-width=".8"/>
-           <ellipse cx="0" cy="${-hh*.15}" rx="${hw*.18}" ry="${hh*.06}" fill="rgba(${parseInt(color.slice(1,3),16)},${parseInt(color.slice(3,5),16)},${parseInt(color.slice(5,7),16)},.55)"/>`
-        : '';
-
-    /* ---- Truck-specific: cargo box outline ---- */
-    const truckCargo = isTruck
-        ? `<rect x="${-hw*.82}" y="${-hh*.18}" width="${hw*1.64}" height="${hh*1.0}" rx="4" fill="none" stroke="rgba(255,255,255,.10)" stroke-width="1.2"/>
-           <line x1="${-hw*.82}" y1="${hh*.22}" x2="${hw*.82}" y2="${hh*.22}" stroke="rgba(255,255,255,.06)" stroke-width=".7"/>`
-        : '';
-
-    /* ---- Roof highlight strip ---- */
-    const roofLine = isMoto ? '' : `<line x1="0" y1="${-hh*.62}" x2="0" y2="${hh*.5}" stroke="rgba(255,255,255,.14)" stroke-width="${isBus?2.2:1.2}"/>`;
-
-    /* ---- Edge outline ---- */
-    const bodyOutline = `<path d="${bPath}" fill="none" stroke="rgba(255,255,255,.18)" stroke-width=".9"/>`;
-
-    /* ---- Ground shadow ellipse ---- */
-    const groundShadow = `<ellipse cx="2" cy="${hh*.82}" rx="${hw*.68}" ry="${hh*.12}" fill="rgba(0,0,0,.55)"/>`;
-
-    /* ---- Assemble full SVG ---- */
     return `<div style="width:${w}px;height:${h}px;position:relative;pointer-events:none;transform-origin:${hw}px ${hh}px">
-  <div style="position:absolute;inset:-${Math.round(w*.6)}px;background:radial-gradient(circle,${color}30 0%,transparent 55%);border-radius:50%;animation:_3dmPulse 2.6s ease-in-out infinite;pointer-events:none;will-change:opacity,transform"></div>
+  <div style="position:absolute;inset:-${Math.round(w*.55)}px;background:radial-gradient(circle,${color}32 0%,transparent 58%);border-radius:50%;animation:_3dmPulse 2.6s ease-in-out infinite;pointer-events:none;will-change:opacity,transform"></div>
   <svg width="${w}" height="${h}" viewBox="${-hw} ${-hh} ${w} ${h}" xmlns="http://www.w3.org/2000/svg" style="overflow:visible;display:block">
     <defs>
-      <linearGradient id="_vg3d${key}" x1="0%" y1="0%" x2="0%" y2="100%">
-        <stop offset="0%" stop-color="${hi}"/>
-        <stop offset="18%" stop-color="${_3dmLight(color,40)}"/>
-        <stop offset="50%" stop-color="${color}"/>
-        <stop offset="82%" stop-color="${accent}"/>
-        <stop offset="100%" stop-color="${color}66"/>
+      <linearGradient id="_vg${key}" x1="0%" y1="0%" x2="0%" y2="100%">
+        <stop offset="0%" stop-color="${hi}"/><stop offset="45%" stop-color="${color}"/><stop offset="100%" stop-color="${color}88"/>
       </linearGradient>
-      <linearGradient id="_vsg3d${key}" x1="0%" y1="0%" x2="100%" y2="0%">
-        <stop offset="0%" stop-color="rgba(255,255,255,.04)"/>
-        <stop offset="35%" stop-color="rgba(255,255,255,.30)"/>
-        <stop offset="50%" stop-color="rgba(255,255,255,.42)"/>
-        <stop offset="65%" stop-color="rgba(255,255,255,.25)"/>
-        <stop offset="100%" stop-color="rgba(255,255,255,.02)"/>
+      <linearGradient id="_vsg${key}" x1="0%" y1="0%" x2="100%" y2="0%">
+        <stop offset="0%" stop-color="rgba(255,255,255,.22)"/><stop offset="50%" stop-color="rgba(255,255,255,.40)"/><stop offset="100%" stop-color="rgba(255,255,255,.08)"/>
       </linearGradient>
-      <radialGradient id="_vrg3d${key}" cx="40%" cy="30%" r="60%">
-        <stop offset="0%" stop-color="rgba(255,255,255,.22)"/>
-        <stop offset="100%" stop-color="rgba(255,255,255,0)"/>
-      </radialGradient>
-      <filter id="_vf3d${key}" x="-80%" y="-80%" width="260%" height="260%">
-        <feGaussianBlur in="SourceAlpha" stdDeviation="5" result="b"/>
-        <feFlood flood-color="${color}" flood-opacity=".6" result="c"/>
+      <filter id="_vf${key}" x="-80%" y="-80%" width="260%" height="260%">
+        <feGaussianBlur in="SourceAlpha" stdDeviation="4.5" result="b"/>
+        <feFlood flood-color="${color}" flood-opacity=".65" result="c"/>
         <feComposite in="c" in2="b" operator="in" result="g"/>
         <feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge>
       </filter>
-      <filter id="_glass3d${key}" x="-20%" y="-20%" width="140%" height="140%">
-        <feGaussianBlur in="SourceGraphic" stdDeviation="0.6"/>
-      </filter>
     </defs>
-    ${groundShadow}
-    ${wheelsAll}
-    <path d="${bPath}" fill="url(#_vg3d${key})" filter="url(#_vf3d${key})"/>
-    <path d="${bPath}" fill="url(#_vsg3d${key})" opacity=".30"/>
-    <path d="${bPath}" fill="url(#_vrg3d${key})" opacity=".45"/>
-    <path d="${wPath}" fill="rgba(140,215,255,.55)" stroke="rgba(255,255,255,.20)" stroke-width=".9" filter="url(#_glass3d${key})"/>
-    ${rwPath}
-    ${sideWins}${busWins}
-    ${doorLines}${roofLine}
-    ${motoDetails}${truckCargo}
-    ${hlGlow}${drl}
-    ${tlGlow}
-    ${bodyOutline}
+    <ellipse cx="2.5" cy="${hh*.75}" rx="${hw*.62}" ry="${hh*.1}" fill="rgba(0,0,0,.5)"/>
+    ${wEls}
+    <path d="${bPath}" fill="url(#_vg${key})" filter="url(#_vf${key})"/>
+    <path d="${bPath}" fill="url(#_vsg${key})" opacity=".35"/>
+    <path d="${wPath}" fill="rgba(165,228,255,.62)" stroke="rgba(255,255,255,.25)" stroke-width=".8"/>
+    ${sideWins}${busWins}${roofLine}
+    ${hlX.map(([x,y])=>`<ellipse cx="${x}" cy="${y}" rx="${hw*.13}" ry="${hh*.055}" fill="rgba(255,250,220,.96)"/><ellipse cx="${x}" cy="${y}" rx="${hw*.24}" ry="${hh*.11}" fill="rgba(255,250,220,.16)"/>`).join('')}
+    <rect x="${-hw*.85}" y="${tlY}" width="${tlW}" height="${tlH}" rx="2.5" fill="rgba(255,38,38,.94)"/>
+    <rect x="${hw*.65}" y="${tlY}" width="${tlW}" height="${tlH}" rx="2.5" fill="rgba(255,38,38,.94)"/>
+    <rect x="${-hw*.86}" y="${tlY}" width="${tlW*1.6}" height="${tlH*1.5}" rx="3" fill="rgba(255,38,38,.12)"/>
+    <rect x="${hw*.54}" y="${tlY}" width="${tlW*1.6}" height="${tlH*1.5}" rx="3" fill="rgba(255,38,38,.12)"/>
+    <ellipse cx="0" cy="${-hh*.91}" rx="${hw*.1}" ry="${hh*.048}" fill="rgba(255,255,255,.94)"/>
+    <path d="${bPath}" fill="none" stroke="rgba(255,255,255,.16)" stroke-width=".75"/>
   </svg>
 </div>`;
 }
 
-/* ── Night theme v5 — Tesla/Google-level ───────────────── */
+/* ── Night theme v3 ─────────────────────────────────────── */
 function _3dmNightTheme(map) {
     const ls = map.getStyle()?.layers || [];
     ls.forEach(({id,type}) => {
         try {
             if (type==='background') {
-                map.setPaintProperty(id,'background-color','#010308');
+                map.setPaintProperty(id,'background-color','#020710');
             } else if (type==='fill') {
-                let c='#030810';
-                if (/water|ocean|sea|lake|reservoir|bay|wetland/.test(id))            c='#010514';
-                else if (/park|garden|forest|wood|grass|green|nature|meadow/.test(id)) c='#020a04';
-                else if (/building/.test(id))                                          c='#0a0f18';
-                else if (/sand|beach|desert/.test(id))                                c='#05070c';
-                else if (/industrial/.test(id))                                        c='#040a14';
-                else if (/commercial|retail/.test(id))                                c='#040e1a';
-                else if (/residential|suburb/.test(id))                               c='#030714';
-                else if (/pitch|playground|sport/.test(id))                           c='#020a04';
-                else if (/landuse|farmland|cemetery/.test(id))                        c='#030810';
+                let c='#040912';
+                if (/water|ocean|sea|lake|reservoir|bay|wetland/.test(id))            c='#010818';
+                else if (/park|garden|forest|wood|grass|green|nature|meadow/.test(id)) c='#021006';
+                else if (/building/.test(id))                                          c='#06101c';
+                else if (/sand|beach|desert/.test(id))                                c='#07090f';
+                else if (/industrial/.test(id))                                        c='#050c16';
+                else if (/commercial|retail/.test(id))                                c='#05101e';
+                else if (/residential|suburb/.test(id))                               c='#040818';
+                else if (/pitch|playground|sport/.test(id))                           c='#030d06';
                 map.setPaintProperty(id,'fill-color',c);
-                try{map.setPaintProperty(id,'fill-outline-color','rgba(4,12,30,.18)');}catch(_){}
+                try{map.setPaintProperty(id,'fill-outline-color','rgba(6,18,45,.25)');}catch(_){}
             } else if (type==='line') {
-                let c='#070e18';let w=null;
-                if (/motorway/.test(id))                      {c='#1a2a4a';w=1.2;}
-                else if (/trunk/.test(id))                    {c='#152440';w=1.1;}
-                else if (/primary/.test(id))                  {c='#112038';w=1.0;}
-                else if (/secondary/.test(id))                {c='#0d1a30';w=0.9;}
-                else if (/tertiary/.test(id))                 {c='#0a1528';w=0.8;}
-                else if (/residential|living_street/.test(id)) c='#081220';
-                else if (/service|alley/.test(id))            c='#060c16';
-                else if (/footway|path|steps/.test(id))       c='#040a12';
-                else if (/water|river|canal|stream/.test(id)) c='#020610';
-                else if (/rail|railway|transit/.test(id))     c='#0c1628';
-                else if (/bridge/.test(id))                   c='#14203c';
-                else if (/boundary|country|state/.test(id))   c='#101830';
+                let c='#0a1628';
+                if (/motorway/.test(id))                      c='#263e7a';
+                else if (/trunk/.test(id))                    c='#1e3670';
+                else if (/primary/.test(id))                  c='#182e5e';
+                else if (/secondary/.test(id))                c='#12244a';
+                else if (/tertiary/.test(id))                 c='#0e1d38';
+                else if (/residential|living_street/.test(id)) c='#0b152c';
+                else if (/service|alley/.test(id))            c='#08101e';
+                else if (/footway|path|steps/.test(id))       c='#070c18';
+                else if (/water|river|canal|stream/.test(id)) c='#040f24';
+                else if (/rail|railway|transit/.test(id))     c='#101e36';
+                else if (/bridge/.test(id))                   c='#1a2648';
+                else if (/boundary|country|state/.test(id))   c='#1c2a48';
+                else if (/tunnel/.test(id))                   c='#060c1a';
                 map.setPaintProperty(id,'line-color',c);
             } else if (type==='symbol') {
                 const isM=/motorway|highway/.test(id), isP=/trunk|primary/.test(id);
                 const isC=/city|capital|town|village|place/.test(id);
                 const isR=/road|street|secondary|tertiary/.test(id);
                 const isW=/water|ocean|sea|lake|river/.test(id);
-                let tc='#0a1628';
-                if(isM)tc='#1a3060'; else if(isP)tc='#142850'; else if(isC)tc='#162c54'; else if(isR)tc='#0e1830'; else if(isW)tc='#081830';
+                let tc='#0c1c36';
+                if(isM)tc='#213e76'; else if(isP)tc='#1c3268'; else if(isC)tc='#1e3668'; else if(isR)tc='#121e3c'; else if(isW)tc='#091c3c';
                 try{map.setPaintProperty(id,'text-color',tc);}catch(_){}
-                try{map.setPaintProperty(id,'text-halo-color','#010206');}catch(_){}
-                try{map.setPaintProperty(id,'text-halo-width',isC?1.6:isP?1.2:0.8);}catch(_){}
-                try{map.setPaintProperty(id,'icon-opacity',isC?0.4:0.08);}catch(_){}
+                try{map.setPaintProperty(id,'text-halo-color','#01040a');}catch(_){}
+                try{map.setPaintProperty(id,'text-halo-width',isC?1.6:isP?1.2:0.9);}catch(_){}
+                try{map.setPaintProperty(id,'text-halo-blur',0.5);}catch(_){}
+                try{map.setPaintProperty(id,'icon-opacity',isC?0.55:isM||isP?0.38:0.14);}catch(_){}
             }
         } catch(_) {}
     });
 
-    // Sky atmosphere — 5-stop gradient with horizon glow
+    // Sky atmosphere
     try {
         if (!map.getLayer('sky')) {
-            map.addLayer({id:'sky',type:'sky',paint:{
+            _3dmSafeAddLayer(map,{id:'sky',type:'sky',paint:{
                 'sky-type':'gradient',
-                'sky-gradient':['interpolate',['linear'],['sky-radial-progress'],
-                    0,'rgba(1,2,6,1)',0.2,'rgba(2,4,12,1)',0.5,'rgba(3,6,18,1)',0.8,'rgba(4,8,22,1)',1,'rgba(6,12,30,1)'],
+                'sky-gradient':['interpolate',['linear'],['sky-radial-progress'],0,'rgba(1,3,10,1)',0.4,'rgba(2,5,16,1)',0.8,'rgba(3,7,22,1)',1,'rgba(5,10,28,1)'],
                 'sky-gradient-center':[0,0],'sky-gradient-radius':90,
-                'sky-opacity':['interpolate',['linear'],['zoom'],0,0,6,0.7,10,1]
+                'sky-opacity':['interpolate',['linear'],['zoom'],0,0,7,1]
             }});
         }
     } catch(_) {}
 
-    // Atmospheric fog — exponential depth for 3D feel
-    try {
-        map.setFog({
-            color:'#030810',
-            'high-color':'#060e1e',
-            'horizon-blend':0.08,
-            'space-color':'#010206',
-            'star-intensity':0.15,
-            range:[1.0, 12.0]
-        });
-    } catch(_) {}
-
-    // Road casing — dark edges on major roads
+    // Road casing
     try {
         if (!map.getLayer('_3rc')) {
             const srcs=map.getStyle()?.sources||{};
             const sk=Object.keys(srcs).find(k=>k==='openmaptiles'||/tile|planet|basemap/.test(k));
             if(sk){
-                map.addLayer({id:'_3rc',source:sk,'source-layer':'transportation',type:'line',minzoom:11,
+                _3dmSafeAddLayer(map,{id:'_3rc',source:sk,'source-layer':'transportation',type:'line',minzoom:12,
                     layout:{'line-join':'round','line-cap':'butt'},
                     paint:{
-                        'line-color':['case',
-                            ['==',['get','class'],'motorway'],'#060c18',
-                            ['==',['get','class'],'trunk'],'#050a14',
-                            ['==',['get','class'],'primary'],'#040810',
-                            '#030608'],
+                        'line-color':'rgba(0,0,0,.88)',
                         'line-width':['interpolate',['linear'],['zoom'],
-                            11,['case',['==',['get','class'],'motorway'],5,['==',['get','class'],'primary'],3,1.5],
-                            16,['case',['==',['get','class'],'motorway'],18,['==',['get','class'],'primary'],12,5],
-                            20,['case',['==',['get','class'],'motorway'],28,['==',['get','class'],'primary'],18,8]],
-                        'line-opacity':['interpolate',['linear'],['zoom'],11,0.4,14,0.9]
+                            12,['case',['==',['get','class'],'motorway'],6,['==',['get','class'],'primary'],3.5,1.8],
+                            18,['case',['==',['get','class'],'motorway'],16,['==',['get','class'],'primary'],10,4]],
                     }
                 },'_3rG');
             }
@@ -3486,7 +3458,7 @@ function _3dmNightTheme(map) {
     } catch(_) {}
 }
 
-/* ── 7-layer premium buildings — Tesla/Google-level ─────── */
+/* ── 5-layer buildings ──────────────────────────────────── */
 function _3dmBuildings(map) {
     const srcs=map.getStyle()?.sources||{};
     const sk=Object.keys(srcs).find(k=>k==='openmaptiles'||k==='maptiler'||/tile|planet|basemap/.test(k));
@@ -3495,64 +3467,40 @@ function _3dmBuildings(map) {
     const bE=['coalesce',['get','render_min_height'],['get','min_height'],['get','building:min_height'],0];
     const hA=['interpolate',['linear'],['zoom'],13.5,0,15,hE];
     const bA=['interpolate',['linear'],['zoom'],13.5,0,15,bE];
+    const oA=['interpolate',['linear'],['zoom'],13,0,14.5,1];
     try {
-        // Upgraded directional lighting
-        try{map.setLight({anchor:'viewport',color:'hsl(220,55%,80%)',position:[1.5,210,50],intensity:0.7});}catch(_){}
-
-        // L1 — Deep ground shadow (wide offset for dramatic depth)
-        map.addLayer({id:'_3bs',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:13,
-            paint:{'fill-extrusion-color':'#000204',
-                   'fill-extrusion-height':hE,'fill-extrusion-base':bE,
-                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],13,0,14.5,0.85],
-                   'fill-extrusion-translate':[8,12],'fill-extrusion-translate-anchor':'viewport'}});
-
-        // L2 — Main body with deep vertical gradient + ambient occlusion
-        map.addLayer({id:'_3bm',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:13,
+        try{map.setLight({anchor:'viewport',color:'hsl(220,60%,85%)',position:[1.2,220,45],intensity:0.6});}catch(_){}
+        // L1 Wide shadow
+        _3dmSafeAddLayer(map,{id:'_3bs',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:13,
+            paint:{'fill-extrusion-color':'#010309','fill-extrusion-height':hE,'fill-extrusion-base':bE,
+                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],13,0,14.5,0.80],
+                   'fill-extrusion-translate':[7,10],'fill-extrusion-translate-anchor':'viewport'}});
+        // L2 Main body
+        _3dmSafeAddLayer(map,{id:'_3bm',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:13,
             paint:{'fill-extrusion-color':['interpolate',['linear'],['zoom'],
-                       13,'#060c18',14,'#081220',15,'#0a1830',16,'#0c1e3c',17,'#0e244a',18,'#102a56'],
-                   'fill-extrusion-height':hA,'fill-extrusion-base':bA,
-                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],13,0,14.5,1],
+                       13,'#06101e',14,'#081528',15,'#0a1932',16,'#0c1f40',17,'#0e2750',18,'#112d60'],
+                   'fill-extrusion-height':hA,'fill-extrusion-base':bA,'fill-extrusion-opacity':oA,
                    'fill-extrusion-vertical-gradient':true,
-                   'fill-extrusion-ambient-occlusion-intensity':1.0,'fill-extrusion-ambient-occlusion-radius':8}});
-
-        // L3 — Edge highlight (thin bright outline for 3D depth perception)
-        map.addLayer({id:'_3be',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:14,
-            paint:{'fill-extrusion-color':['interpolate',['linear'],['zoom'],14,'#0e1e3a',17,'#1a3060',19,'#264080'],
-                   'fill-extrusion-height':hE,'fill-extrusion-base':bE,
-                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],14,0,16,0.28,19,0.45],
-                   'fill-extrusion-translate':[-1.5,-1.5],'fill-extrusion-translate-anchor':'viewport'}});
-
-        // L4 — Warm face accent for medium buildings (≥15m)
-        map.addLayer({id:'_3bw',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:14,
+                   'fill-extrusion-ambient-occlusion-intensity':0.85,'fill-extrusion-ambient-occlusion-radius':8}});
+        // L3 Warm face (>15m)
+        _3dmSafeAddLayer(map,{id:'_3bw',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:14,
             filter:['>=',['coalesce',['get','height'],0],15],
-            paint:{'fill-extrusion-color':['interpolate',['linear'],['zoom'],14,'#0a1828',17,'#0e2240'],
+            paint:{'fill-extrusion-color':['interpolate',['linear'],['zoom'],14,'#0a1930',17,'#0e2646'],
                    'fill-extrusion-height':hE,'fill-extrusion-base':bE,
-                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],14,0,16,0.32],
-                   'fill-extrusion-translate':[-3,-3],'fill-extrusion-translate-anchor':'viewport'}});
-
-        // L5 — Cool blue accent for tall buildings (≥35m)
-        map.addLayer({id:'_3ba',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:15,
-            filter:['>=',['coalesce',['get','height'],0],35],
-            paint:{'fill-extrusion-color':['interpolate',['linear'],['zoom'],15,'#0e1e42',18,'#1a3878'],
+                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],14,0,16,0.30],
+                   'fill-extrusion-translate':[-2,-2],'fill-extrusion-translate-anchor':'viewport'}});
+        // L4 Cool accent (>30m)
+        _3dmSafeAddLayer(map,{id:'_3ba',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:15,
+            filter:['>=',['coalesce',['get','height'],0],30],
+            paint:{'fill-extrusion-color':['interpolate',['linear'],['zoom'],15,'#0e2044',18,'#1a3a7a'],
                    'fill-extrusion-height':hE,'fill-extrusion-base':bE,
-                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],15,0,17,0.38],
-                   'fill-extrusion-translate':[-5,-5],'fill-extrusion-translate-anchor':'viewport'}});
-
-        // L6 — Roof cap glow (subtle top highlight)
-        map.addLayer({id:'_3br',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:16,
-            paint:{'fill-extrusion-color':['interpolate',['linear'],['zoom'],16,'#1a3060',19,'#2a6aff'],
-                   'fill-extrusion-height':hE,
-                   'fill-extrusion-base':['max',['coalesce',['get','height'],0],0.15],
-                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],15,0,17,0.40,20,0.70]}});
-
-        // L7 — Window lights on tall buildings (warm scattered effect)
-        map.addLayer({id:'_3bwl',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:16,
-            filter:['>=',['coalesce',['get','height'],0],20],
-            paint:{'fill-extrusion-color':['interpolate',['linear'],['zoom'],16,'#1a2840',18,'#2a4068',20,'#3a5890'],
-                   'fill-extrusion-height':['*',hE,0.92],
-                   'fill-extrusion-base':['*',['max',['coalesce',['get','height'],0],1],0.15],
-                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],16,0,18,0.18,20,0.30],
-                   'fill-extrusion-vertical-gradient':true}});
+                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],15,0,17,0.35],
+                   'fill-extrusion-translate':[-4,-4],'fill-extrusion-translate-anchor':'viewport'}});
+        // L5 Roof cap glow
+        _3dmSafeAddLayer(map,{id:'_3br',source:sk,'source-layer':'building',type:'fill-extrusion',minzoom:16,
+            paint:{'fill-extrusion-color':['interpolate',['linear'],['zoom'],16,'#1e3e6a',19,'#2a6aff'],
+                   'fill-extrusion-height':hE,'fill-extrusion-base':['max',['coalesce',['get','height'],0],0.2],
+                   'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],15,0,17,0.42,20,0.72]}});
     } catch(e){console.warn('[3D buildings]',e);}
 }
 
@@ -3570,77 +3518,63 @@ function _3dmUpdateAccRing(lat,lon,acc){
         const src=_3DM.map.getSource('_3acc');
         if(src){src.setData(data);return;}
         _3DM.map.addSource('_3acc',{type:'geojson',data});
-        _3DM.map.addLayer({id:'_3accF',type:'fill',source:'_3acc',paint:{'fill-color':'rgba(0,220,255,.05)'}});
-        _3DM.map.addLayer({id:'_3accL',type:'line',source:'_3acc',paint:{'line-color':'rgba(0,220,255,.45)','line-width':1.5,'line-dasharray':[4,3]}});
+        _3dmSafeAddLayer(_3DM.map,{id:'_3accF',type:'fill',source:'_3acc',paint:{'fill-color':'rgba(79,158,255,.07)'}});
+        _3dmSafeAddLayer(_3DM.map,{id:'_3accL',type:'line',source:'_3acc',paint:{'line-color':'rgba(79,158,255,.55)','line-width':1.5,'line-dasharray':[4,3]}});
     }catch(_){}
 }
 
-/* ── 7-layer route — cyan glow (Google/Tesla-level) ────── */
+/* ── Route layers ───────────────────────────────────────── */
 function _3dmRouteLayer(map,coords){
     const feat=c=>({type:'Feature',geometry:{type:'LineString',coordinates:c}});
     const seed=coords.length>=2?[coords[0],coords[0]]:[[0,0],[0,0]];
-    map.addSource('_3r', {type:'geojson',data:feat(coords)});
-    map.addSource('_3rd',{type:'geojson',data:feat(seed)});
-    map.addSource('_3rr',{type:'geojson',data:feat(coords)});
-
-    // L1 — Ultra-wide outer halo (atmospheric glow)
-    map.addLayer({id:'_3rG',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
-        paint:{'line-color':'rgba(0,220,255,.06)','line-width':['interpolate',['linear'],['zoom'],10,32,16,60,20,85],'line-blur':28}});
-
-    // L2 — Mid glow
-    map.addLayer({id:'_3rH',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
-        paint:{'line-color':'rgba(0,210,240,.20)','line-width':['interpolate',['linear'],['zoom'],10,14,16,30,20,44],'line-blur':10}});
-
-    // L3 — Route body casing (dark base)
-    map.addLayer({id:'_3rC',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
-        paint:{'line-color':'rgba(0,30,40,.92)','line-width':['interpolate',['linear'],['zoom'],10,6,16,16,20,22]}});
-
-    // L4 — Main route (vivid cyan)
-    map.addLayer({id:'_3rM',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
-        paint:{'line-color':'#00dce8','line-width':['interpolate',['linear'],['zoom'],10,4.5,16,12,20,18]}});
-
-    // L5 — Inner bright core
-    map.addLayer({id:'_3rI',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
-        paint:{'line-color':'rgba(180,255,255,.88)','line-width':['interpolate',['linear'],['zoom'],10,1.5,16,3.5,20,5]}});
-
-    // L6 — Animated flow dashes
-    map.addLayer({id:'_3rF',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
-        paint:{'line-color':'rgba(255,255,255,.55)','line-width':['interpolate',['linear'],['zoom'],10,2.5,16,5,20,7],
-               'line-dasharray':[3,6]}});
-
-    // L7 — Travelled overlay (darkened path behind)
-    map.addLayer({id:'_3rD',type:'line',source:'_3rd',layout:{'line-join':'round','line-cap':'round'},
-        paint:{'line-color':'rgba(0,20,30,.85)','line-width':['interpolate',['linear'],['zoom'],10,5,16,14,20,20]}});
-
-    // Destination marker — pulsing red with halo
+    _3dmSafeAddSource(map,'_3r', {type:'geojson',data:feat(coords)});
+    _3dmSafeAddSource(map,'_3rd',{type:'geojson',data:feat(seed)});
+    _3dmSafeAddSource(map,'_3rr',{type:'geojson',data:feat(coords)});
+    // Outer glow
+    _3dmSafeAddLayer(map,{id:'_3rG',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
+        paint:{'line-color':'rgba(0,230,118,.09)','line-width':['interpolate',['linear'],['zoom'],10,28,18,56],'line-blur':20}});
+    // Mid glow
+    _3dmSafeAddLayer(map,{id:'_3rH',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
+        paint:{'line-color':'rgba(0,230,118,.32)','line-width':['interpolate',['linear'],['zoom'],10,12,18,26],'line-blur':7}});
+    // Main — vivid green
+    _3dmSafeAddLayer(map,{id:'_3rM',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
+        paint:{'line-color':'#06f080','line-width':['interpolate',['linear'],['zoom'],10,4.5,18,13],'line-opacity':0.95}});
+    // Inner core — bright white-green
+    _3dmSafeAddLayer(map,{id:'_3rI',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
+        paint:{'line-color':'rgba(220,255,238,.95)','line-width':['interpolate',['linear'],['zoom'],10,1.6,18,4.0]}});
+    // Animated direction dashes
+    _3dmSafeAddLayer(map,{id:'_3rF',type:'line',source:'_3rr',layout:{'line-join':'round','line-cap':'round'},
+        paint:{'line-color':'rgba(255,255,255,.65)','line-width':['interpolate',['linear'],['zoom'],10,2.5,18,6],
+               'line-dasharray':[2.5,5.5]}});
+    // Travelled — dark overlay
+    _3dmSafeAddLayer(map,{id:'_3rD',type:'line',source:'_3rd',layout:{'line-join':'round','line-cap':'round'},
+        paint:{'line-color':'rgba(0,25,12,.88)','line-width':['interpolate',['linear'],['zoom'],10,5,18,14]}});
+    // Destination
     if(coords.length){
         const dest=coords[coords.length-1];
-        map.addSource('_3dest',{type:'geojson',data:{type:'Feature',geometry:{type:'Point',coordinates:dest}}});
-        map.addLayer({id:'_3destH',type:'circle',source:'_3dest',
-            paint:{'circle-radius':['interpolate',['linear'],['zoom'],12,22,18,48],'circle-color':'rgba(255,60,60,.12)','circle-blur':0.6}});
-        map.addLayer({id:'_3destO',type:'circle',source:'_3dest',
-            paint:{'circle-radius':['interpolate',['linear'],['zoom'],12,9,18,20],'circle-color':'#ff4545',
-                   'circle-stroke-color':'rgba(255,255,255,.90)','circle-stroke-width':3}});
-        map.addLayer({id:'_3destP',type:'circle',source:'_3dest',
-            paint:{'circle-radius':4.5,'circle-color':'rgba(255,255,255,.98)','circle-stroke-color':'#ff4545','circle-stroke-width':2.5}});
-
-        // Start marker — cyan glow
-        const start=coords[0];
-        map.addSource('_3strt',{type:'geojson',data:{type:'Feature',geometry:{type:'Point',coordinates:start}}});
-        map.addLayer({id:'_3strtH',type:'circle',source:'_3strt',
-            paint:{'circle-radius':['interpolate',['linear'],['zoom'],12,16,18,36],'circle-color':'rgba(0,220,255,.10)','circle-blur':0.5}});
-        map.addLayer({id:'_3strtO',type:'circle',source:'_3strt',
-            paint:{'circle-radius':['interpolate',['linear'],['zoom'],12,7,18,14],'circle-color':'#00dce8',
+        _3dmSafeAddSource(map,'_3dest',{type:'geojson',data:{type:'Feature',geometry:{type:'Point',coordinates:dest}}});
+        _3dmSafeAddLayer(map,{id:'_3destH',type:'circle',source:'_3dest',
+            paint:{'circle-radius':['interpolate',['linear'],['zoom'],12,18,18,40],'circle-color':'rgba(255,69,69,.14)','circle-blur':0.5}});
+        _3dmSafeAddLayer(map,{id:'_3destO',type:'circle',source:'_3dest',
+            paint:{'circle-radius':['interpolate',['linear'],['zoom'],12,8,18,18],'circle-color':'#ff4545',
                    'circle-stroke-color':'rgba(255,255,255,.85)','circle-stroke-width':2.5}});
+        _3dmSafeAddLayer(map,{id:'_3destP',type:'circle',source:'_3dest',
+            paint:{'circle-radius':4,'circle-color':'rgba(255,255,255,.95)','circle-stroke-color':'#ff4545','circle-stroke-width':2}});
+        // Start dot
+        const start=coords[0];
+        _3dmSafeAddSource(map,'_3strt',{type:'geojson',data:{type:'Feature',geometry:{type:'Point',coordinates:start}}});
+        _3dmSafeAddLayer(map,{id:'_3strtO',type:'circle',source:'_3strt',
+            paint:{'circle-radius':['interpolate',['linear'],['zoom'],12,6,18,12],'circle-color':'#4f9eff',
+                   'circle-stroke-color':'rgba(255,255,255,.8)','circle-stroke-width':2}});
     }
 }
 
-/* ── Animate flow dashes — smoother 60ms cycle ─────────── */
+/* ── Animate flow dashes ────────────────────────────────── */
 let _3dmDashStep=0;
 function _3dmAnimateDashes(){
     if(!_3DM.map||!_3DM.styleReady)return;
-    const now=performance.now();if(now-_3DM._dashTs<60)return;_3DM._dashTs=now;
-    _3dmDashStep=(_3dmDashStep+0.35)%9;
+    const now=performance.now();if(now-_3DM._dashTs<80)return;_3DM._dashTs=now;
+    _3dmDashStep=(_3dmDashStep+0.5)%9;
     try{
         const d=_3dmDashStep;
         _3DM.map.setPaintProperty('_3rF','line-dasharray',[Math.max(0.1,3-d%3),Math.max(0.1,6-d%6)]);
@@ -3651,7 +3585,7 @@ function _3dmAnimateDashes(){
 function _3dmUpdateRoute(lat,lon){
     if(!_3DM.map||!_3DM.styleReady)return;
     const lls=_3DM.routeLLs;if(lls.length<2)return;
-    const now=performance.now();if(now-_3DM._routeTimer<200)return;_3DM._routeTimer=now;
+    const now=performance.now();if(now-_3DM._routeTimer<150)return;_3DM._routeTimer=now;
     try{
         const near=_nearestPointOnRoute(lat,lon,lls);
         const doneLL=[...lls.slice(0,near.idx+1),[near.lat,near.lon]];
@@ -3691,46 +3625,50 @@ function _3dmStopDeviceOrientation(){
     _3DM._devOrFn=null;_3DM.devOrient=false;
 }
 
-/* ── Speed-reactive zoom — Tesla-level close view ──────── */
+/* ── Speed-reactive zoom ────────────────────────────────── */
 function _3dmSpeedZoom(kmh){
-    if(kmh<2)  return 18.8;
-    if(kmh<15) return 18.2;
-    if(kmh<40) return 17.4;
-    if(kmh<80) return 16.8;
-    return 16.2;
+    if(kmh<2)  return 18.5;
+    if(kmh<15) return 18.0;
+    if(kmh<40) return 17.5;
+    if(kmh<80) return 17.0;
+    return 16.5;
 }
 
-/* ── Camera follow — smoother Tesla-level chase cam ────── */
+/* ── Camera follow ──────────────────────────────────────── */
 function _3dmFollowCam(dt){
     if(!_3DM.map||!_3DM.styleReady||_3DM.rndLat===null)return;
     if(_3DM.userRotating||(_3DM.map.isMoving?.()&&!_3DM.followMode))return;
     const jp={pitch:_3DM.pitchMode};
     if(_3DM.followMode){
-        const aPos=Math.min(1,dt*6.5);
+        const aPos=Math.min(1,dt*7.0); // faster catch-up
         _3DM.camLat+=(_3DM.rndLat-_3DM.camLat)*aPos;
         _3DM.camLon+=(_3DM.rndLon-_3DM.camLon)*aPos;
         jp.center=[_3DM.camLon,_3DM.camLat];
         const spd=_navActive?userSpeedKmh:0;
         const tZ=_3dmSpeedZoom(spd);
-        _3DM.zoomNav+=((tZ)-_3DM.zoomNav)*Math.min(1,dt*1.2);
-        jp.zoom=_3DM.zoomNav;
+        _3DM.zoomNav+=((tZ)-_3DM.zoomNav)*Math.min(1,dt*1.2); // faster zoom
+        jp.zoom=Math.round(_3DM.zoomNav*10)/10; // no sub-pixel jitter
     }
     if(_3DM.followHeading){
-        const aBear=Math.min(1,dt*5.5);
+        // Speed-adaptive bearing: faster when moving, gentler when stationary
+        const bSpd=typeof userSpeedKmh!=='undefined'?userSpeedKmh:0;
+        const aBear=Math.min(1,dt*(bSpd>10?5.5:bSpd>2?3.5:1.5));
         const bd=_angleDiff(_3DM.camBearing,_3DM.tgtBearing);
-        _3DM.camBearing=(_3DM.camBearing+bd*aBear+360)%360;
-        jp.bearing=_3DM.camBearing;
+        if(Math.abs(bd)>0.1){ // skip tiny corrections
+            _3DM.camBearing=(_3DM.camBearing+bd*aBear+360)%360;
+            jp.bearing=Math.round(_3DM.camBearing*10)/10;
+        }
     }
     if(Object.keys(jp).length>1){try{_3DM.map.jumpTo(jp);}catch(_){}}
     const rb=_3DM.followHeading?_3DM.camBearing:(_3DM.map?.getBearing()??0);
     const cp=$('nav3d-compass');if(cp)cp.style.transform=`rotate(${-rb}deg)`;
 }
 
-/* ── Speed colour — cyan-themed ─────────────────────────── */
+/* ── Speed colour ───────────────────────────────────────── */
 function _3dmSpeedColor(kmh){
-    if(kmh<1)  return '#3a5a7a';
-    if(kmh<30) return '#00dce8';
-    if(kmh<60) return '#00e676';
+    if(kmh<1)  return '#4a6a8a';
+    if(kmh<30) return '#00e676';
+    if(kmh<60) return '#4f9eff';
     if(kmh<90) return '#ffd740';
     return '#ff4545';
 }
@@ -3773,7 +3711,7 @@ function _3dmLoop(ts){
     if(userLat!==null&&userLon!==null&&!_gpsUsingFallback){_3DM.curLat=userLat;_3DM.curLon=userLon;_3DM.curAcc=_lastFixAccuracy??15;}
     if(_3DM.curLat===null){_3dmHUD();_3DM.rafId=requestAnimationFrame(_3dmLoop);return;}
     if(_3DM.rndLat===null){_3DM.rndLat=_3DM.curLat;_3DM.rndLon=_3DM.curLon;}
-    else{const a=Math.min(1,dt*9.0);_3DM.rndLat+=(_3DM.curLat-_3DM.rndLat)*a;_3DM.rndLon+=(_3DM.curLon-_3DM.rndLon)*a;}
+    else{const a=Math.min(1,dt*12.0);_3DM.rndLat+=(_3DM.curLat-_3DM.rndLat)*a;_3DM.rndLon+=(_3DM.curLon-_3DM.rndLon)*a;}
     if(_navActive&&userHeading!==null&&userSpeedKmh>2.5){_3DM.gpsBearing=userHeading;if(_3DM.followHeading)_3DM.tgtBearing=userHeading;}
     else if(_3DM.devOrient&&_3DM.followHeading){_3DM.tgtBearing=_3DM.devBearing;}
     if(_3DM.vehicleMarker&&_3DM.styleReady){try{_3DM.vehicleMarker.setLngLat([_3DM.rndLon,_3DM.rndLat]);_3DM.vehicleMarker.setRotation(_3DM.tgtBearing);}catch(_){}}
@@ -3801,7 +3739,7 @@ function open3DView(routeIdx){
     Object.assign(_3DM,{active:true,styleReady:false,lastTs:null,followMode:true,followHeading:true,userRotating:false,
         curLat:hasGPS?userLat:null,curLon:hasGPS?userLon:null,curAcc:_lastFixAccuracy??20,
         rndLat:hasGPS?userLat:null,rndLon:hasGPS?userLon:null,camLat:sLat,camLon:sLon,
-        camBearing:sBear,tgtBearing:hasGPS?(userHeading??sBear):sBear,gpsBearing:sBear,zoomNav:17.8,pitchMode:67});
+        camBearing:sBear,tgtBearing:hasGPS?(userHeading??sBear):sBear,gpsBearing:sBear,zoomNav:18.0});
     const ov=$('nav-3d-overlay');if(ov){ov.classList.remove('hidden');requestAnimationFrame(()=>ov.classList.add('show'));}
     document.body.classList.add('nav-3d-mode');
     const loaderEl=$('nav3d-loader');if(loaderEl)loaderEl.classList.remove('hidden');
@@ -3812,9 +3750,8 @@ function open3DView(routeIdx){
             container:'nav-3d-map',style:'https://tiles.openfreemap.org/styles/liberty',
             center:[sLon,sLat],zoom:_3DM.zoomNav,pitch:_3DM.pitchMode,bearing:sBear,
             antialias:true,attributionControl:false,logoPosition:'bottom-right',
-            maxBounds:INDIA_BOUNDS,minZoom:4,maxZoom:20.5,maxTileCacheSize:400,
+            maxBounds:INDIA_BOUNDS,minZoom:4,maxZoom:20,maxTileCacheSize:300,
             dragRotate:true,touchZoomRotate:true,touchPitch:true,keyboard:false,renderWorldCopies:false,
-            fadeDuration:100,crossSourceCollisions:false,
         });
         _3DM.map.on('load',()=>{
             if(!_3DM.active){try{_3DM.map?.remove();}catch(_){}return;}
@@ -3841,15 +3778,30 @@ function open3DView(routeIdx){
 }
 
 /* ── Close 3D ───────────────────────────────────────────── */
+/* All 3D layer/source IDs — clean before map.remove() to avoid WebGL leaks */
+const _3DM_LAYER_IDS = ['_3bs','_3bm','_3bw','_3ba','_3br','sky','_3rc','_3pg',
+    '_3rG','_3rH','_3rM','_3rI','_3rF','_3rD','_3destH','_3destO','_3destP','_3strtO',
+    '_3accF','_3accL'];
+const _3DM_SOURCE_IDS = ['_3r','_3rd','_3rr','_3dest','_3strt','_3acc'];
+
 function close3DView(){
     _3DM.active=false;_3DM.styleReady=false;
     if(_3DM.rafId){cancelAnimationFrame(_3DM.rafId);_3DM.rafId=null;}
     _3dmStopDeviceOrientation();
     if(window._3dmRzFn){window.removeEventListener('resize',window._3dmRzFn);window._3dmRzFn=null;}
     try{_3DM.vehicleMarker?.remove();}catch(_){}_3DM.vehicleMarker=null;
-    try{_3DM.map?.remove();}catch(_){}_3DM.map=null;
+    // Cleanly remove all layers+sources before map.remove() to prevent WebGL leaks
+    if(_3DM.map){
+        try{
+            _3DM_LAYER_IDS.forEach(id=>{try{if(_3DM.map.getLayer&&_3DM.map.getLayer(id))_3DM.map.removeLayer(id);}catch(_){}});
+            _3DM_SOURCE_IDS.forEach(id=>{try{if(_3DM.map.getSource&&_3DM.map.getSource(id))_3DM.map.removeSource(id);}catch(_){}});
+        }catch(_){}
+        try{_3DM.map.remove();}catch(_){}
+    }
+    _3DM.map=null;
     _3DM.rndLat=null;_3DM.rndLon=null;_3DM.curLat=null;_3DM.curLon=null;
-    const ov=$('nav-3d-overlay');if(ov){ov.classList.remove('show');setTimeout(()=>ov.classList.add('hidden'),380);}
+    const ov=$('nav-3d-overlay');
+    if(ov){ov.classList.remove('show');setTimeout(()=>ov.classList.add('hidden'),380);}
     document.body.classList.remove('nav-3d-mode');
 }
 
@@ -4146,13 +4098,28 @@ function _initSettings(){
         el.addEventListener('change',()=>{const p=_loadPrefs();p[key]=el.checked;_savePrefs(p);_onPrefChange(key,el.checked);});
     });
 
-    // Waklock management
+    // WakeLock management
     let _wakeLock=null;
     async function _requestWakeLock(){
-        try{if('wakeLock' in navigator&&prefs.wakelock!==false){_wakeLock=await navigator.wakeLock.request('screen');}}catch(_){}
+        if(!('wakeLock' in navigator)) return;
+        const p=_loadPrefs();if(p.wakelock===false) return;
+        try{
+            _wakeLock=await navigator.wakeLock.request('screen');
+            _wakeLock.addEventListener('release',()=>{ _wakeLock=null; });
+        }catch(_){}
     }
-    async function _releaseWakeLock(){if(_wakeLock){try{await _wakeLock.release();}catch(_){}_wakeLock=null;}}
-    document.getElementById('sw-wakelock')?.addEventListener('change',e=>{e.target.checked?_requestWakeLock():_releaseWakeLock();});
+    async function _releaseWakeLock(){
+        if(_wakeLock){try{await _wakeLock.release();}catch(_){}_wakeLock=null;}
+    }
+    document.getElementById('sw-wakelock')?.addEventListener('change',e=>{
+        e.target.checked?_requestWakeLock():_releaseWakeLock();
+    });
+    // Re-acquire on visibility change (browser revokes on tab switch)
+    document.addEventListener('visibilitychange',async()=>{
+        if(document.visibilityState==='visible'&&typeof _navActive!=='undefined'&&_navActive){
+            await _requestWakeLock();
+        }
+    });
     if(prefs.wakelock!==false) _requestWakeLock();
 
     // GPS diagnostics button
@@ -4582,16 +4549,8 @@ function _initProfile(){
     }
 }
 
-/* ── Better GPS: Kalman tuning ───────────────────────────── */
-function _upgradeKalmanFilter(){
-    // Dynamically tune Kalman filter R based on GPS accuracy
-    // This overrides the existing setAccuracy to be more responsive
-    if(typeof _kfLat==='undefined'||typeof _kfLon==='undefined') return;
-    // More responsive defaults
-    _kfLat.Q=3e-5; // Process noise — slightly higher = more responsive to real movement
-    _kfLon.Q=3e-5;
-    // R (measurement noise) will be set per-fix by onGPSFix setAccuracy call
-}
+/* ── Kalman filter is pre-tuned at construction, no runtime upgrade needed ── */
+function _upgradeKalmanFilter(){ /* no-op — tuned at init */ }
 
 /* ── Main init ──────────────────────────────────────────── */
 function _init(){
@@ -4621,66 +4580,690 @@ function _init(){
         });
     }
 
-    // Demo trips
-    if(_loadTrips().length===0){
-        _recordTrip('Connaught Place, New Delhi',8.2,24,'Best Route');
-        _recordTrip('Cyber City, Gurugram',15.4,38,'Fastest');
-        _recordTrip('Indira Gandhi International Airport',22.1,52,'Best Route');
-    }
-
-    /* ── Merged from _uxPolish: Speed colour + GPS pill + arrow polling ── */
-    let _lastArrowDir='';
-    setInterval(()=>{
+    // ── Speed colour on main nav HUD (poll every 400ms) ──────
+    const _spEl=document.getElementById('nav-speed-val');
+    window._smartnavPollId=null; // module-level so close3DView can clear it
+    function _pollGPS(){
         // Speed colour
-        const spd=userSpeedKmh||0;
-        const sEl=document.getElementById('nav-speed-val');
-        if(sEl){
-            sEl.classList.remove('nav-speed-val-green','nav-speed-val-blue','nav-speed-val-yellow','nav-speed-val-red');
-            if(spd>80) sEl.classList.add('nav-speed-val-red');
-            else if(spd>50) sEl.classList.add('nav-speed-val-yellow');
-            else if(spd>10) sEl.classList.add('nav-speed-val-blue');
-            else if(spd>1) sEl.classList.add('nav-speed-val-green');
+        if(_spEl){
+            const spd=typeof userSpeedKmh!=='undefined'?userSpeedKmh:0;
+            _spEl.classList.remove('nav-speed-val-green','nav-speed-val-blue','nav-speed-val-yellow','nav-speed-val-red');
+            if(spd>80)      _spEl.classList.add('nav-speed-val-red');
+            else if(spd>50) _spEl.classList.add('nav-speed-val-yellow');
+            else if(spd>10) _spEl.classList.add('nav-speed-val-blue');
+            else if(spd>1)  _spEl.classList.add('nav-speed-val-green');
         }
-        // GPS pill
+        // GPS pill quality
         const pill=document.getElementById('gps-pill');
         if(pill){
-            pill.classList.remove('good','warn','error');
             const acc=typeof _lastFixAccuracy!=='undefined'?_lastFixAccuracy:null;
-            if(!acc||acc>9000) pill.classList.add('warn');
-            else if(acc<15) pill.classList.add('good');
-            else if(acc>50) pill.classList.add('error');
+            pill.classList.remove('good','warn','error');
+            if(!acc||acc>9000)pill.classList.add('warn');
+            else if(acc<15)pill.classList.add('good');
+            else if(acc>50)pill.classList.add('error');
             else pill.classList.add('warn');
         }
-        // Direction arrow bounce
-        const arr=document.getElementById('nav-direction-arrow');
-        if(arr&&arr.textContent!==_lastArrowDir){
-            arr.style.transform='scale(1.25)';
-            setTimeout(()=>{if(arr)arr.style.transform='';},200);
-            _lastArrowDir=arr.textContent;
+        // 3D GPS status - _3dmHUD is called by the 3D RAF loop, no need to call here
+        // Just ensure 3D badge reflects GPS state when active
+        if(typeof _3DM!=='undefined'&&_3DM.active&&_3DM.styleReady){
+            const gpsStat=document.getElementById('nav3d-gps-status');
+            if(gpsStat){
+                const acc=typeof _lastFixAccuracy!=='undefined'?_lastFixAccuracy:null;
+                if(typeof _gpsUsingFallback!=='undefined'&&_gpsUsingFallback){gpsStat.textContent='📡 Acquiring GPS…';gpsStat.style.color='rgba(255,173,0,.75)';}
+                else if(acc&&acc<9999){const aStr=`±${Math.round(acc)}m`;gpsStat.textContent=`📍 GPS ${aStr}`;gpsStat.style.color=acc<15?'rgba(0,230,118,.85)':acc<50?'rgba(255,215,0,.8)':'rgba(255,120,0,.8)';}
+            }
         }
-    },400);
+    }
+    window._smartnavPollId=setInterval(_pollGPS,400);
 
-    /* ── Merged from _uxPolish: Search chip active feedback ── */
-    document.querySelectorAll('.search-chip').forEach(chip=>{
-        chip.addEventListener('click',()=>{
-            document.querySelectorAll('.search-chip').forEach(c=>c.classList.remove('active'));
-            chip.classList.add('active');
-            setTimeout(()=>chip.classList.remove('active'),2500);
-        });
-    });
-
-    /* ── Merged from _uxPolish: Back button closes panels ── */
+    // ── Back button closes open pages ────────────────────────
     window.addEventListener('popstate',()=>{
-        ['profile','activity','navigate'].forEach(id=>{
+        ['profile','activity','navigate','settings'].forEach(id=>{
             const el=document.getElementById(`page-${id}`);
             if(el?.classList.contains('visible')){el.classList.remove('visible');el.classList.add('hidden');}
         });
         const qa=document.getElementById('quick-add-sheet');
         if(qa?.classList.contains('visible')){qa.classList.remove('visible');qa.classList.add('hidden');}
     });
+
+    // ── Direction arrow bounce on change ────────────────────
+    let _lastArrow='';
+    setInterval(()=>{
+        const arr=document.getElementById('nav-direction-arrow');
+        if(arr&&arr.textContent!==_lastArrow){
+            const prev=arr.style.transform||'';
+            const rot=prev.match(/rotate\([^)]+\)/)?.[0]||'';
+            arr.style.transform=rot?`${rot} scale(1.28)`:'scale(1.28)';
+            setTimeout(()=>{arr.style.transform=rot;},180);
+            _lastArrow=arr.textContent;
+        }
+    },300);
+
+    // Demo trips
+    if(_loadTrips().length===0){
+        _recordTrip('Connaught Place, New Delhi',8.2,24,'Best Route');
+        _recordTrip('Cyber City, Gurugram',15.4,38,'Fastest');
+        _recordTrip('Indira Gandhi International Airport',22.1,52,'Best Route');
+    }
 }
 
 if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',_init);}
 else{setTimeout(_init,100);}
 
 })(); // end SmartNavUI IIFE
+
+
+/* ================================================================
+   UX POLISH v4 — Speed colours, transitions, search fixes
+================================================================ */
+
+/* ================================================================
+   ADMIN PANEL v1.0 — Login, Dashboard, Live Map, Beacon Sender
+================================================================ */
+(function SmartNavAdmin() {
+'use strict';
+
+/* ── Beacon sender ──────────────────────────────────────────── */
+// Sends the user's GPS position to /api/beacon after they grant permission.
+// Fires every 30 s while the page is visible. All data is anonymous and
+// tied only to the server-assigned session cookie — no user identity.
+let _beaconTimer = null;
+let _beaconActive = false;
+
+async function _sendBeacon() {
+    if (typeof userLat === 'undefined' || userLat === null) return;
+    if (typeof _gpsUsingFallback !== 'undefined' && _gpsUsingFallback) return;
+    try {
+        await fetch('/api/beacon', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                lat: userLat,
+                lon: userLon,
+                acc: typeof _lastFixAccuracy !== 'undefined' ? (_lastFixAccuracy || 0) : 0,
+                spd: typeof userSpeedKmh !== 'undefined' ? Math.round(userSpeedKmh || 0) : 0,
+                city: '', address: '',
+            }),
+            keepalive: true,
+        });
+    } catch (_) {}
+}
+
+function _startBeacon() {
+    if (_beaconActive) return;
+    _beaconActive = true;
+    _sendBeacon(); // immediate first ping
+    _beaconTimer = setInterval(_sendBeacon, 30_000);
+}
+
+// Start beaconing once GPS is live (detect via polling)
+let _beaconCheckTimer = setInterval(() => {
+    if (typeof userLat !== 'undefined' && userLat !== null &&
+        typeof _gpsUsingFallback !== 'undefined' && !_gpsUsingFallback) {
+        clearInterval(_beaconCheckTimer);
+        _startBeacon();
+    }
+}, 5_000);
+
+// Stop on page hide, restart on page show
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+        if (_beaconTimer) { clearInterval(_beaconTimer); _beaconTimer = null; _beaconActive = false; }
+    } else {
+        if (typeof userLat !== 'undefined' && userLat !== null) _startBeacon();
+    }
+});
+
+/* ── Admin state ────────────────────────────────────────────── */
+let _adminLoggedIn = false;
+let _adminPollTimer = null;
+let _adminLiveMap = null;
+let _adminLiveMarkers = {};
+let _adminData = null;
+let _adminCurrentUser = null;
+let _adminDrawerMap = null;
+
+/* ── DOM refs ───────────────────────────────────────────────── */
+const _adminLoginOverlay = document.getElementById('admin-login-overlay');
+const _adminPanel        = document.getElementById('admin-panel');
+const _adminEmailInp     = document.getElementById('admin-email-inp');
+const _adminPassInp      = document.getElementById('admin-pass-inp');
+const _adminLoginBtn     = document.getElementById('admin-login-btn');
+const _adminLoginCancel  = document.getElementById('admin-login-cancel');
+const _adminLoginErr     = document.getElementById('admin-login-err');
+const _adminLogoutBtn    = document.getElementById('admin-logout-btn');
+const _adminRefreshBtn   = document.getElementById('admin-refresh-btn');
+const _adminDrawer       = document.getElementById('admin-user-drawer');
+const _adminDrawerBody   = document.getElementById('admin-drawer-body');
+const _adminDrawerClose  = document.getElementById('admin-drawer-close');
+const _adminLastRefresh  = document.getElementById('admin-last-refresh');
+const _adminLiveCount    = document.getElementById('admin-live-count');
+
+/* ── Utilities ──────────────────────────────────────────────── */
+function _adminEsc(s) {
+    return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function _fmtTs(ts) {
+    if (!ts) return '—';
+    const d = new Date(ts * 1000), now = Date.now();
+    const diff = Math.floor((now - ts * 1000) / 1000);
+    if (diff < 60)  return `${diff}s ago`;
+    if (diff < 3600) return `${Math.floor(diff/60)}m ago`;
+    if (diff < 86400) return `${Math.floor(diff/3600)}h ago`;
+    return d.toLocaleDateString('en-IN', { month:'short', day:'numeric' });
+}
+
+function _fmtCoord(v) {
+    return v != null ? Number(v).toFixed(5) : '—';
+}
+
+function _showAdminOverlay(el) {
+    el.classList.remove('hidden');
+    requestAnimationFrame(() => el.classList.add('visible'));
+}
+
+function _hideAdminOverlay(el) {
+    el.classList.remove('visible');
+    setTimeout(() => el.classList.add('hidden'), 300);
+}
+
+/* ── Open admin (from settings) ─────────────────────────────── */
+document.getElementById('open-admin-btn')?.addEventListener('click', () => {
+    // Close settings panel first
+    const settingsPanel = document.getElementById('page-settings');
+    if (settingsPanel) { settingsPanel.classList.remove('visible'); setTimeout(() => settingsPanel.classList.add('hidden'), 320); }
+    setTimeout(() => {
+        if (_adminLoggedIn) {
+            _openDashboard();
+        } else {
+            _showAdminOverlay(_adminLoginOverlay);
+            _adminEmailInp?.focus();
+        }
+    }, 160);
+});
+
+/* ── Login ──────────────────────────────────────────────────── */
+async function _doLogin() {
+    const email = _adminEmailInp?.value.trim() || '';
+    const pass  = _adminPassInp?.value || '';
+    if (!email || !pass) { _showLoginErr('Enter email and password'); return; }
+
+    _adminLoginBtn.textContent = 'Signing in…';
+    _adminLoginBtn.classList.add('loading');
+    _hideLoginErr();
+
+    try {
+        const res = await fetch('/admin/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password: pass }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+            _adminLoggedIn = true;
+            _hideAdminOverlay(_adminLoginOverlay);
+            setTimeout(_openDashboard, 350);
+        } else {
+            _showLoginErr(data.error || 'Invalid credentials');
+        }
+    } catch (_) {
+        _showLoginErr('Connection error — is the server running?');
+    } finally {
+        _adminLoginBtn.textContent = 'Sign In';
+        _adminLoginBtn.classList.remove('loading');
+    }
+}
+
+function _showLoginErr(msg) {
+    if (_adminLoginErr) { _adminLoginErr.textContent = msg; _adminLoginErr.classList.remove('hidden'); }
+}
+function _hideLoginErr() { _adminLoginErr?.classList.add('hidden'); }
+
+_adminLoginBtn?.addEventListener('click', _doLogin);
+_adminLoginCancel?.addEventListener('click', () => _hideAdminOverlay(_adminLoginOverlay));
+_adminEmailInp?.addEventListener('keydown', e => { if (e.key === 'Enter') _adminPassInp?.focus(); });
+_adminPassInp?.addEventListener('keydown', e => { if (e.key === 'Enter') _doLogin(); });
+
+/* ── Dashboard open ─────────────────────────────────────────── */
+function _openDashboard() {
+    _showAdminOverlay(_adminPanel);
+    _loadAdminData();
+    _startAdminPoll();
+}
+
+async function _logout() {
+    await fetch('/admin/logout', { method: 'POST' }).catch(() => {});
+    _adminLoggedIn = false;
+    _stopAdminPoll();
+    _closeDrawer();
+    if (_adminLiveMap) { try { _adminLiveMap.remove(); } catch(_){} _adminLiveMap = null; _adminLiveMarkers = {}; }
+    if (_adminDrawerMap) { try { _adminDrawerMap.remove(); } catch(_){} _adminDrawerMap = null; }
+    _hideAdminOverlay(_adminPanel);
+}
+
+_adminLogoutBtn?.addEventListener('click', _logout);
+
+/* ── Tabs ────────────────────────────────────────────────────── */
+document.querySelectorAll('.admin-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+        document.querySelectorAll('.admin-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        const tabId = tab.dataset.tab;
+        document.querySelectorAll('.admin-content').forEach(c => c.classList.add('hidden'));
+        const target = document.getElementById(`admin-tab-${tabId}`);
+        if (target) target.classList.remove('hidden');
+        if (tabId === 'live') _renderLiveMap();
+    });
+});
+
+/* ── Refresh ─────────────────────────────────────────────────── */
+_adminRefreshBtn?.addEventListener('click', () => {
+    _adminRefreshBtn.classList.add('spinning');
+    _loadAdminData().finally(() => {
+        setTimeout(() => _adminRefreshBtn.classList.remove('spinning'), 500);
+    });
+});
+
+function _startAdminPoll() {
+    if (_adminPollTimer) return;
+    _adminPollTimer = setInterval(_loadAdminData, 15_000);
+}
+function _stopAdminPoll() {
+    if (_adminPollTimer) { clearInterval(_adminPollTimer); _adminPollTimer = null; }
+}
+
+/* ── Load admin data ──────────────────────────────────────────── */
+let _adminUserSearchBound = false;   // guard: only bind search input once
+
+async function _loadAdminData() {
+    try {
+        const res = await fetch('/admin/data');
+        if (res.status === 401) { _adminLoggedIn = false; _stopAdminPoll(); _logout(); return; }
+        const data = await res.json();
+        _adminData = data;
+        _renderStats(data.stats);
+        _renderOverviewTable(data.sessions);
+        _renderUsersTable(data.sessions);
+        _updateLiveMarkers(data.live || []);
+        if (_adminLastRefresh) {
+            _adminLastRefresh.textContent = new Date().toLocaleTimeString('en-IN', {
+                hour: '2-digit', minute: '2-digit', second: '2-digit'
+            });
+        }
+    } catch (_) { /* network hiccup — retry on next poll */ }
+}
+
+/* ── Stats ─────────────────────────────────────────────────────── */
+function _renderStats(s) {
+    if (!s) return;
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v ?? '—'; };
+    set('asc-total',   s.total_sessions);
+    set('asc-live',    s.live_now);
+    set('asc-loc',     s.location_granted);
+    set('asc-today',   s.today);
+    set('asc-mobile',  s.mobile);
+    set('asc-beacons', s.total_beacons);
+}
+
+/* ── Overview table ─────────────────────────────────────────────── */
+function _renderOverviewTable(sessions) {
+    const el = document.getElementById('admin-overview-table');
+    const countEl = document.getElementById('admin-overview-count');
+    if (!el) return;
+
+    if (!sessions?.length) {
+        el.innerHTML = '<div class="admin-empty"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="rgba(79,158,255,.25)" stroke-width="1.5"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg><span>No sessions yet</span></div>';
+        if (countEl) countEl.textContent = '';
+        return;
+    }
+
+    const top20 = sessions.slice(0, 20);
+    if (countEl) countEl.textContent = `Showing ${top20.length} of ${sessions.length}`;
+
+    const rows = top20.map(s => `
+        <tr data-sid="${_adminEsc(s.session_id)}" style="cursor:pointer">
+            <td>${s.is_live
+                ? '<span class="admin-live-badge">&#9679;&nbsp;Live</span>'
+                : '<span class="admin-offline-badge">Offline</span>'}</td>
+            <td title="${_adminEsc(s.ip)}" style="font-family:monospace;font-size:.72rem">${_adminEsc(s.ip || '—')}</td>
+            <td>
+                <div style="font-weight:500">${_adminEsc(s.browser || '—')}</div>
+                <div style="font-size:.62rem;color:#3a5a7a;margin-top:2px">${_adminEsc(s.os_name || '')}${s.device_type ? ' · ' + _adminEsc(s.device_type) : ''}</div>
+            </td>
+            <td>${s.lat != null
+                ? `<span style="color:#4f9eff;font-family:monospace;font-size:.72rem">${Number(s.lat).toFixed(4)},&thinsp;${Number(s.lon).toFixed(4)}</span>`
+                : '<span style="color:#2a4060;font-size:.70rem">No GPS</span>'}</td>
+            <td>${_adminEsc(s.city || '—')}</td>
+            <td style="font-size:.72rem;color:#8ab0d0">${_fmtTs(s.last_seen)}</td>
+            <td style="text-align:center;color:#6090b0">${s.page_views || 1}</td>
+        </tr>`).join('');
+
+    el.innerHTML = `<table class="admin-table">
+        <thead><tr>
+            <th>Status</th><th>IP Address</th><th>Browser / OS</th>
+            <th>Last Location</th><th>City</th><th>Last Seen</th><th>Views</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+    </table>`;
+    el.querySelectorAll('tr[data-sid]').forEach(row =>
+        row.addEventListener('click', () => _openDrawer(row.dataset.sid)));
+}
+
+/* ── Users table ────────────────────────────────────────────────── */
+function _renderUsersTable(sessions) {
+    // Bind search box only once (not on every data refresh)
+    if (!_adminUserSearchBound) {
+        const searchEl = document.getElementById('admin-user-search');
+        if (searchEl) {
+            searchEl.addEventListener('input', function () {
+                _renderFilteredUsers(_adminData?.sessions || [], this.value.toLowerCase().trim());
+            });
+            _adminUserSearchBound = true;
+        }
+    }
+    const q = document.getElementById('admin-user-search')?.value?.toLowerCase().trim() || '';
+    _renderFilteredUsers(sessions, q);
+}
+
+function _renderFilteredUsers(sessions, filter) {
+    const el = document.getElementById('admin-users-table');
+    if (!el) return;
+    const filtered = filter
+        ? sessions.filter(s =>
+            (s.ip || '').includes(filter) ||
+            (s.browser || '').toLowerCase().includes(filter) ||
+            (s.city || '').toLowerCase().includes(filter) ||
+            (s.os_name || '').toLowerCase().includes(filter) ||
+            (s.device_type || '').toLowerCase().includes(filter))
+        : sessions;
+
+    if (!filtered.length) {
+        el.innerHTML = '<div class="admin-empty"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="rgba(79,158,255,.25)" stroke-width="1.5"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg><span>No matching sessions</span></div>';
+        return;
+    }
+
+    const rows = filtered.map(s => `
+        <tr data-sid="${_adminEsc(s.session_id)}" style="cursor:pointer">
+            <td>${s.is_live
+                ? '<span class="admin-live-badge">&#9679;&nbsp;Live</span>'
+                : '<span class="admin-offline-badge">Offline</span>'}</td>
+            <td style="font-family:monospace;font-size:.70rem">${_adminEsc(s.ip || '—')}</td>
+            <td style="font-weight:500">${_adminEsc(s.browser || '—')}</td>
+            <td>${_adminEsc(s.os_name || '—')}</td>
+            <td>${_adminEsc(s.device_type || '—')}</td>
+            <td style="font-family:monospace;font-size:.70rem;color:#4f9eff">${
+                s.lat != null ? `${Number(s.lat).toFixed(4)},&thinsp;${Number(s.lon).toFixed(4)}` : '<span style="color:#2a4060">—</span>'}</td>
+            <td>${_adminEsc(s.city || '—')}</td>
+            <td title="${_adminEsc(s.user_agent || '')}"
+                style="max-width:130px;overflow:hidden;text-overflow:ellipsis;font-size:.66rem;color:#5a8aaa">
+                ${_adminEsc((s.user_agent || '').substring(0, 55))}${(s.user_agent||'').length > 55 ? '…' : ''}</td>
+            <td style="font-size:.70rem;color:#8ab0d0">${_fmtTs(s.first_seen)}</td>
+            <td style="font-size:.70rem;color:#8ab0d0">${_fmtTs(s.last_seen)}</td>
+            <td style="text-align:center;color:#6090b0">${s.page_views || 1}</td>
+        </tr>`).join('');
+
+    el.innerHTML = `<table class="admin-table">
+        <thead><tr>
+            <th>Status</th><th>IP</th><th>Browser</th><th>OS</th><th>Device</th>
+            <th>Coordinates</th><th>City</th><th>User Agent</th>
+            <th>First Seen</th><th>Last Seen</th><th>Views</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+    </table>`;
+    el.querySelectorAll('tr[data-sid]').forEach(row =>
+        row.addEventListener('click', () => _openDrawer(row.dataset.sid)));
+}
+
+/* ── Live Map ──────────────────────────────────────────────────── */
+function _renderLiveMap() {
+    const container = document.getElementById('admin-live-map');
+    if (!container) return;
+    if (!_adminLiveMap) {
+        _adminLiveMap = L.map('admin-live-map', {
+            center: [20.5937, 78.9629], zoom: 5,
+            zoomControl: true, attributionControl: false,
+        });
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+            subdomains: 'abcd', maxZoom: 19,
+        }).addTo(_adminLiveMap);
+        // Invalidate after brief delay so the container has final dimensions
+        setTimeout(() => { try { _adminLiveMap.invalidateSize(); } catch(_){} }, 120);
+    }
+    _updateLiveMarkers(_adminData?.live || []);
+}
+
+function _updateLiveMarkers(liveUsers) {
+    if (!_adminLiveMap) return;
+    if (_adminLiveCount) {
+        const n = liveUsers.length;
+        _adminLiveCount.textContent = `${n} user${n !== 1 ? 's' : ''} live`;
+    }
+    const seenIds = new Set();
+    liveUsers.forEach(u => {
+        if (u.lat == null || u.lon == null) return;
+        seenIds.add(u.session_id);
+        const lat = Number(u.lat), lon = Number(u.lon);
+        if (!isFinite(lat) || !isFinite(lon)) return;
+
+        const popContent = `<div style="font-size:.74rem;line-height:1.7;color:#c0d0e8">
+            <b style="color:#00e676">&#9679; Live</b><br>
+            <b>IP:</b> ${_adminEsc(u.ip)}<br>
+            <b>Browser:</b> ${_adminEsc(u.browser || '—')}<br>
+            <b>OS:</b> ${_adminEsc(u.os_name || '—')}<br>
+            <b>Device:</b> ${_adminEsc(u.device_type || '—')}<br>
+            <b>Speed:</b> ${u.speed_kmh != null ? Math.round(u.speed_kmh) + ' km/h' : '—'}<br>
+            <b>Accuracy:</b> ${u.accuracy_m != null ? Math.round(u.accuracy_m) + ' m' : '—'}<br>
+            <b>City:</b> ${_adminEsc(u.city || '—')}<br>
+            <b>Updated:</b> ${_fmtTs(u.last_beacon_ts)}
+        </div>`;
+
+        if (_adminLiveMarkers[u.session_id]) {
+            _adminLiveMarkers[u.session_id].setLatLng([lat, lon]);
+            _adminLiveMarkers[u.session_id].getPopup()?.setContent(popContent);
+        } else {
+            const icon = L.divIcon({
+                className: '',
+                html: `<div style="width:14px;height:14px;border-radius:50%;background:#00e676;border:2px solid rgba(255,255,255,.85);box-shadow:0 0 12px rgba(0,230,118,.75),0 0 0 4px rgba(0,230,118,.18)"></div>`,
+                iconSize: [14, 14], iconAnchor: [7, 7],
+            });
+            const marker = L.marker([lat, lon], { icon })
+                .addTo(_adminLiveMap)
+                .bindPopup(popContent, { className: 'admin-map-popup', maxWidth: 230 });
+            marker.on('click', () => _openDrawer(u.session_id));
+            _adminLiveMarkers[u.session_id] = marker;
+        }
+    });
+    // Remove stale markers
+    Object.keys(_adminLiveMarkers).forEach(sid => {
+        if (!seenIds.has(sid)) {
+            try { _adminLiveMap.removeLayer(_adminLiveMarkers[sid]); } catch(_) {}
+            delete _adminLiveMarkers[sid];
+        }
+    });
+}
+
+/* ── User detail drawer ─────────────────────────────────────────── */
+async function _openDrawer(sessionId) {
+    if (!_adminData) return;
+    _adminCurrentUser = (_adminData.sessions || []).find(s => s.session_id === sessionId);
+    if (!_adminCurrentUser) return;
+    const u = _adminCurrentUser;
+
+    // Show drawer immediately with skeleton while beacons load
+    const title = document.getElementById('adr-title');
+    if (title) title.textContent = u.ip || 'User Detail';
+    _adminDrawerBody.innerHTML = '<div class="admin-loading">Loading location data\u2026</div>';
+    _adminDrawer.classList.remove('hidden');
+    requestAnimationFrame(() => _adminDrawer.classList.add('visible'));
+
+    // Fetch beacon history
+    let beacons = [];
+    try {
+        const res = await fetch(`/admin/session/${encodeURIComponent(sessionId)}`);
+        if (res.ok) {
+            const data = await res.json();
+            beacons = data.beacons || [];
+        }
+    } catch (_) {}
+
+    const locSection = beacons.length ? `
+        <div>
+            <div class="adr-section">Last Known Location</div>
+            <div id="adr-mini-map" class="adr-map"></div>
+            <div class="adr-row" style="margin-top:8px">
+                <span class="adr-key">Coordinates</span>
+                <span class="adr-val">${_fmtCoord(beacons[0]?.lat)},&thinsp;${_fmtCoord(beacons[0]?.lon)}</span>
+            </div>
+            <div class="adr-row">
+                <span class="adr-key">Accuracy</span>
+                <span class="adr-val">${beacons[0]?.accuracy_m != null ? Math.round(beacons[0].accuracy_m) + ' m' : '—'}</span>
+            </div>
+            <div class="adr-row">
+                <span class="adr-key">Speed</span>
+                <span class="adr-val">${beacons[0]?.speed_kmh != null ? Math.round(beacons[0].speed_kmh) + ' km/h' : '—'}</span>
+            </div>
+            <div class="adr-row">
+                <span class="adr-key">City</span>
+                <span class="adr-val">${_adminEsc(beacons[0]?.city || '—')}</span>
+            </div>
+            <div class="adr-row">
+                <span class="adr-key">When</span>
+                <span class="adr-val">${_fmtTs(beacons[0]?.ts)}</span>
+            </div>
+        </div>
+        <div>
+            <div class="adr-section">Location History (${beacons.length} ping${beacons.length !== 1 ? 's' : ''})</div>
+            ${beacons.map((b, i) => `
+            <div class="adr-beacon-row">
+                <div class="adr-beacon-dot${i === 0 ? ' latest' : ''}"></div>
+                <div class="adr-beacon-info">
+                    <div class="adr-beacon-coord">${_fmtCoord(b.lat)},&thinsp;${_fmtCoord(b.lon)}</div>
+                    <div class="adr-beacon-meta">${_fmtTs(b.ts)}&ensp;&middot;&ensp;&plusmn;${
+                        b.accuracy_m != null ? Math.round(b.accuracy_m) : '?'}m&ensp;&middot;&ensp;${
+                        b.speed_kmh != null ? Math.round(b.speed_kmh) : 0} km/h${
+                        b.city ? '&ensp;&middot;&ensp;' + _adminEsc(b.city) : ''}</div>
+                </div>
+            </div>`).join('')}
+        </div>` : `
+        <div class="admin-empty" style="padding:24px 12px">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="rgba(79,158,255,.25)" stroke-width="1.5">
+                <circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>
+            </svg>
+            <span>No location data<br><small style="color:#2a4060">User has not granted GPS</small></span>
+        </div>`;
+
+    _adminDrawerBody.innerHTML = `
+        <div>
+            <div class="adr-section">Identity</div>
+            <div class="adr-row">
+                <span class="adr-key">Session ID</span>
+                <span class="adr-val" style="font-size:.58rem">${_adminEsc(sessionId.substring(0, 16))}&hellip;</span>
+            </div>
+            <div class="adr-row">
+                <span class="adr-key">IP Address</span>
+                <span class="adr-val">${_adminEsc(u.ip || '—')}</span>
+            </div>
+            <div class="adr-row">
+                <span class="adr-key">Status</span>
+                <span class="adr-val">${u.is_live
+                    ? '<span style="color:#00e676;font-weight:600">&#9679;&nbsp;Live</span>'
+                    : '<span style="color:#3a5a7a">Offline</span>'}</span>
+            </div>
+        </div>
+        <div>
+            <div class="adr-section">Device</div>
+            <div class="adr-row">
+                <span class="adr-key">Browser</span>
+                <span class="adr-val">${_adminEsc(u.browser || '—')}</span>
+            </div>
+            <div class="adr-row">
+                <span class="adr-key">OS</span>
+                <span class="adr-val">${_adminEsc(u.os_name || '—')}</span>
+            </div>
+            <div class="adr-row">
+                <span class="adr-key">Device Type</span>
+                <span class="adr-val">${_adminEsc(u.device_type || '—')}</span>
+            </div>
+            <div class="adr-row">
+                <span class="adr-key">User Agent</span>
+                <span class="adr-val" style="font-size:.58rem;word-break:break-all;white-space:normal">
+                    ${_adminEsc((u.user_agent || '').substring(0, 130))}${(u.user_agent||'').length > 130 ? '…' : ''}</span>
+            </div>
+        </div>
+        <div>
+            <div class="adr-section">Activity</div>
+            <div class="adr-row">
+                <span class="adr-key">First Seen</span>
+                <span class="adr-val">${_fmtTs(u.first_seen)}</span>
+            </div>
+            <div class="adr-row">
+                <span class="adr-key">Last Seen</span>
+                <span class="adr-val">${_fmtTs(u.last_seen)}</span>
+            </div>
+            <div class="adr-row">
+                <span class="adr-key">Page Views</span>
+                <span class="adr-val">${u.page_views || 1}</span>
+            </div>
+            <div class="adr-row">
+                <span class="adr-key">GPS Granted</span>
+                <span class="adr-val">${u.loc_granted
+                    ? '<span style="color:#00e676">Yes</span>'
+                    : '<span style="color:#3a5a7a">No</span>'}</span>
+            </div>
+        </div>
+        ${locSection}
+    `;
+
+    // Render mini-map if we have beacon coordinates
+    if (beacons.length && beacons[0]?.lat != null) {
+        setTimeout(() => {
+            const mapEl = document.getElementById('adr-mini-map');
+            if (!mapEl) return;
+            if (_adminDrawerMap) {
+                try { _adminDrawerMap.remove(); } catch(_) {}
+                _adminDrawerMap = null;
+            }
+            _adminDrawerMap = L.map('adr-mini-map', {
+                center: [Number(beacons[0].lat), Number(beacons[0].lon)],
+                zoom: 14, zoomControl: false, attributionControl: false,
+            });
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                subdomains: 'abcd', maxZoom: 19,
+            }).addTo(_adminDrawerMap);
+            beacons.forEach((b, i) => {
+                if (b.lat == null || b.lon == null) return;
+                const sz = i === 0 ? 13 : 7;
+                const col = i === 0 ? '#00e676' : '#4f9eff';
+                const icon = L.divIcon({
+                    className: '',
+                    html: `<div style="width:${sz}px;height:${sz}px;border-radius:50%;background:${col};opacity:${i===0?1:0.55};${i===0?'border:2px solid rgba(255,255,255,.85);box-shadow:0 0 8px rgba(0,230,118,.7)':''}"></div>`,
+                    iconSize: [sz, sz], iconAnchor: [sz/2, sz/2],
+                });
+                L.marker([Number(b.lat), Number(b.lon)], { icon }).addTo(_adminDrawerMap);
+            });
+            setTimeout(() => { try { _adminDrawerMap.invalidateSize(); } catch(_){} }, 80);
+        }, 60);
+    }
+}
+
+function _closeDrawer() {
+    _adminDrawer.classList.remove('visible');
+    setTimeout(() => _adminDrawer.classList.add('hidden'), 300);
+    if (_adminDrawerMap) {
+        try { _adminDrawerMap.remove(); } catch(_) {}
+        _adminDrawerMap = null;
+    }
+}
+
+_adminDrawerClose?.addEventListener('click', _closeDrawer);
+
+// Close drawer on Escape key
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && _adminPanel && !_adminPanel.classList.contains('hidden')) {
+        if (_adminDrawer && !_adminDrawer.classList.contains('hidden')) {
+            _closeDrawer();
+        }
+    }
+});
+
+})(); // end SmartNavAdmin

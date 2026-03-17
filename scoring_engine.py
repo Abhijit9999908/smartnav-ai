@@ -116,6 +116,25 @@ def score_routes(routes: list[dict]) -> list[dict]:
     if not routes:
         return []
 
+    # ── Validate and sanitise input routes ────────────────────────────────
+    valid = []
+    for r in routes:
+        try:
+            dist = float(r["distance"])
+            dur  = float(r["duration"])
+            geo  = r.get("geometry", [])
+            if dist <= 0 or dur <= 0:
+                log.warning("score_routes  skipping route with non-positive distance/duration")
+                continue
+            if not isinstance(geo, list):
+                geo = []
+            valid.append({**r, "distance": dist, "duration": dur, "geometry": geo})
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning("score_routes  skipping malformed route: %s", exc)
+    if not valid:
+        log.error("score_routes  all routes were invalid")
+        return []
+    routes = valid
     n = len(routes)
 
     # ── Extract raw per-route metrics ──────────────────────────────────────

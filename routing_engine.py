@@ -1589,3 +1589,4 @@ def fetch_routes(start_lat: float, start_lon: float,
     log.info("fetch_routes  %d unique route(s) from %d candidates (%.1f km trip)",
              len(result), len(all_routes), dist_km)
     return result
+
