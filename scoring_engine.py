@@ -226,3 +226,4 @@ def score_routes(routes: list[dict]) -> list[dict]:
     )
 
     return enriched
+

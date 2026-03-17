@@ -723,3 +723,4 @@ if __name__ == "__main__":
     log.info("SmartNav AI starting  proto=%s  port=%d  render=%s", proto, port, is_render)
     log.info("Open in browser: %s://127.0.0.1:%d", proto, port)
     app.run(**kwargs)
+

@@ -1590,3 +1590,4 @@ def fetch_routes(start_lat: float, start_lon: float,
              len(result), len(all_routes), dist_km)
     return result
 
+
