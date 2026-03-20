@@ -1925,10 +1925,10 @@ body.poi-sheet-open #map-style-panel {
     -webkit-backdrop-filter: blur(28px);
     border-top: 1px solid var(--bdr-h);
     border-radius: var(--r-lg) var(--r-lg) 0 0;
-    padding: 0 14px calc(var(--safe-b) + 18px);
+    padding: 0 14px 0;
     transform: translateY(105%);
     transition: transform var(--t-md);
-    max-height: 44vh;
+    max-height: 52vh;
     overflow-y: auto;
     box-shadow: var(--shadow-nav);
     overscroll-behavior: contain;
@@ -1941,7 +1941,7 @@ body.poi-sheet-open #map-style-panel {
 }
 
 #route-panel.expanded {
-    max-height: 68vh;
+    max-height: 72vh;
 }
 
 #route-panel::-webkit-scrollbar {
@@ -3285,7 +3285,7 @@ body.nav-3d-mode .nav-3d-toggle-btn {
     bottom: 0;
     left: 0;
     right: 0;
-    z-index: 950;
+    z-index: 1150;
     height: calc(var(--bnav-h) + var(--safe-b));
     background: rgba(5,9,20,.97);
     border-top: 1px solid rgba(79,158,255,.12);
@@ -3445,7 +3445,7 @@ body.poi-sheet-open .fab-stack {
 .search-chip:active { transform: scale(0.93); background: rgba(79,158,255,.28); }
 
 /* ================================================================
-   PAGE PANELS (full-screen slide-up)
+   PAGE PANELS (full-screen, fade-in — no slide from side)
 ================================================================ */
 .page-panel {
     position: fixed;
@@ -3455,14 +3455,15 @@ body.poi-sheet-open .fab-stack {
     display: none;
     flex-direction: column;
     overflow: hidden;
-    transform: translateX(100%);
-    transition: transform 0.32s cubic-bezier(0.4,0,0.2,1);
-    will-change: transform;
+    opacity: 0;
+    transform: none;
+    transition: opacity 0.22s ease;
+    will-change: opacity;
 }
 
 .page-panel.visible {
     display: flex;
-    transform: translateX(0);
+    opacity: 1;
     pointer-events: auto;
 }
 
@@ -4133,8 +4134,20 @@ body.poi-sheet-open .fab-stack {
 #route-dest-text { color: var(--white); font-size: 0.88rem; }
 
 .route-start-cta {
-    padding: 12px 14px 0;
+    padding: 12px 14px 8px;
     display: none;
+    position: sticky;
+    bottom: calc(var(--bnav-h) + var(--safe-b) + 4px);
+    background: var(--bg-glass2);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-top: 1px solid var(--bdr);
+    z-index: 2;
+}
+
+/* In nav-mode the bottom nav is off-screen, stick flush to safe area */
+body.nav-mode .route-start-cta {
+    bottom: calc(var(--safe-b) + 4px);
 }
 
 .route-start-cta.show { display: block; }
@@ -4389,13 +4402,13 @@ html { scroll-behavior: smooth; }
     to   { transform: scale(1) translateY(0); }
 }
 
-/* Page panel enter animation */
+/* Page panel enter animation — fade in */
 .page-panel.visible {
-    animation: panelSlideIn .32s cubic-bezier(0.4,0,0.2,1);
+    animation: panelFadeIn .22s ease;
 }
-@keyframes panelSlideIn {
-    from { transform: translateX(100%); }
-    to   { transform: translateX(0); }
+@keyframes panelFadeIn {
+    from { opacity: 0; }
+    to   { opacity: 1; }
 }
 
 /* Skeleton loading shimmer for empty states */
